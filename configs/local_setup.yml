@@ -1,6 +1,6 @@
 # Suggested data paths when using GPT-NeoX locally
 {
-  "data_path": "data/enwik8/enwik8_text_document",
+  "data_path": "data/raw-news-headlines-nyt/raw-news-headlines-nyt_text_document",
 
   # or for weighted datasets:
   # "train-data-paths": ["data/enwik8/enwik8_text_document", "data/enwik8/enwik8_text_document"],
@@ -26,5 +26,5 @@
   "log_dir": "logs",
   "use_wandb": True,
   "wandb_host": "https://api.wandb.ai",
-  "wandb_project": "neox"
+  "wandb_project": "neox-nyt-headlines"
 }

@@ -24,7 +24,7 @@ import torch.nn as nn
 from pkg_resources import packaging
 from importlib.metadata import version
 
-from megatron.model.moe import ParallelDroplessMoE
+from megatron.model.merged_moe import SoftMergingMoE
 
 from .norms import get_norm
 from megatron import mpu
@@ -1010,7 +1010,7 @@ class ParallelTransformerLayer(nn.Module):
             self.mlp = get_mlp(neox_args.mlp_type)
         # Dropless MoE MLP
         else:
-            self.mlp = ParallelDroplessMoE(
+            self.mlp = SoftMergingMoE(
                 neox_args=neox_args,
                 init_method=init_method,
                 output_layer_init_method=output_layer_init_method,
