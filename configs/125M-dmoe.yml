@@ -2,12 +2,12 @@
 {
    # parallelism settings ( you will want to change these based on your cluster setup, ideally scheduling pipeline stages
    # across the node boundaries )
-   "pipe_parallel_size": 2,  # MoE supports PP
-   "model_parallel_size": 2, # MoE uses model parallel group to split both experts and attention weights
+   "pipe_parallel_size": 1,  # MoE supports PP
+   "model_parallel_size": 1, # MoE uses model parallel group to split both experts and attention weights
 
    # model settings
-   "num_layers": 12,
-   "hidden_size": 1024,
+   "num_layers": 8,
+   "hidden_size": 768,
    "num_attention_heads": 16,
    "seq_length": 2048,
    "max_position_embeddings": 2048,
@@ -16,7 +16,9 @@
    "no_weight_tying": true,
 
    # moe settings
-   "moe_num_experts": 8,
+   "moe_num_experts": 4,
+   "moe_router_type": "sparsemixer",
+   "moe_jitter_eps": 0.01,
 
    # these should provide some speedup but takes a while to build, set to true if desired
    "scaled_upper_triang_masked_softmax_fusion": false,
@@ -46,7 +48,7 @@
   },
 
    # batch / data settings
-   "train_micro_batch_size_per_gpu": 4,
+   "train_micro_batch_size_per_gpu": 16,
    "data_impl": "mmap",
    "split": "949,50,1",
 
@@ -66,13 +68,13 @@
 
    "fp32_allreduce": True, # without a patch to torch, bf16 models have to do the allreduce in fp32
    # misc. training settings
-   "train_iters": 5,
-   "lr_decay_iters": 320000,
+   "train_iters": 5000,
+   "lr_decay_iters": 5000,
    "distributed_backend": "nccl",
    "min_lr": 0.0006,
    "warmup": 0.0,
    "checkpoint_factor": 10000,
-   "eval_interval": 1000,
+   "eval_interval": 500,
    "eval_iters": 10,
 
    # logging

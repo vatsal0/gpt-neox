@@ -20,6 +20,7 @@ from megatron.neox_arguments.arguments import NeoXArgs
 
 from .moe_mlp import ParallelGroupedLLaMAMLP, ParallelGroupedMLP
 from .router import TopKTokenChoiceRouter, SinkhornRouter
+from .sparsemixer import SparseMixerRouter
 
 
 class ParallelDroplessMLP(torch.nn.Module):
@@ -231,6 +232,11 @@ class ParallelDroplessMoE(torch.nn.Module):
             )
         elif neox_args.moe_router_type == "topk":
             self.router = TopKTokenChoiceRouter(
+                neox_args,
+                init_method,
+            )
+        elif neox_args.moe_router_type == "sparsemixer":
+            self.router = SparseMixerRouter(
                 neox_args,
                 init_method,
             )
