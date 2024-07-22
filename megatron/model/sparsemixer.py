@@ -6,6 +6,7 @@ from typing import Optional, Dict, List, Union, Tuple, Any, Callable
 from megatron.neox_arguments.arguments import NeoXArgs
 import megablocks.ops
 from megatron.mpu import get_model_parallel_group, get_model_parallel_rank, get_data_parallel_group
+from pdb import set_trace
 
 uniform_map: Dict[torch.device, Callable] = {}
 def multiplicative_jitter(input, epsilon, training):
@@ -51,6 +52,9 @@ class v2core(torch.autograd.Function):
             index=selected_experts,
             src=grad_at_output,
         )
+        # for selected_experts, -masked_gates * grad_at_output + multiplier * grad_at_output
+        # = grad_at_output * (multiplier - masked_gates)
+        # for nonselected experts, grad_at_output * -masked_gates
         
         return (
             grad_at_scores_expaned, 
@@ -60,6 +64,7 @@ class v2core(torch.autograd.Function):
             None, 
         )
 
+# logits -> multipliers, original softmaxed probs, and selected expert indices
 def sparsemixerv2_routing(scores, top_k, jitter_eps, training):
     assert top_k in [1, 2], "only top-1/2 gating has been tested!"
     
@@ -68,8 +73,11 @@ def sparsemixerv2_routing(scores, top_k, jitter_eps, training):
     
     with torch.no_grad():
         # compute mask for sparsity
+        # max logit for each input, along with corresponding index
         mask_logits_threshold, max_ind = scores.max(dim=-1, keepdim=True)
+        # max logit, or absolute value if it was more negative than the max logit was positive
         factor = scores.abs().clamp(min=mask_logits_threshold)
+        # how much lower is each logit from the max logit. if its more than a negligible factor of the max logit, drop
         mask_logits_threshold = (
             (mask_logits_threshold - scores) / factor
         ) > (2 * jitter_eps)
@@ -77,6 +85,9 @@ def sparsemixerv2_routing(scores, top_k, jitter_eps, training):
     # apply mask 
     masked_gates = scores.masked_fill(mask_logits_threshold, float('-inf'))
     if training:
+        # draw from exponential distribution, take its log, subtract that from the logits.
+        # exponential usually less than 1 (subtracting log is like adding up to infinity)
+        # call max, get the index of it, and unsqueeze (so it is N x 1, not just N)
         selected_experts = (
             masked_gates - torch.empty_like(masked_gates, memory_format=torch.legacy_contiguous_format).exponential_().log()
         ).max(dim=-1)[1].unsqueeze(-1) # gumbel sampling, more robust than than the multinomial method
@@ -87,15 +98,22 @@ def sparsemixerv2_routing(scores, top_k, jitter_eps, training):
     masked_gates = torch.softmax(masked_gates, dim=-1)
     
     # compute midpoint mask 
+    # mask if we've selected the highest probability expert
+    # or roughly a 25% random chance
     max_scores, max_ind = masked_gates.max(dim=-1, keepdim=True)
     mask_for_one = torch.logical_or(
         selected_experts == max_ind,
         torch.rand_like(max_scores) > 0.75 # Heun's third-order method: f(x) - f(0) = .25 f'(x) + .75 f'(x/3.)
     ) 
     # 1 -> 1.0 & 0 -> 1./3: lambda x: (x + 0.5) / 1.5
+    # unmasked values are the 1/3, multiplied on to output for the approximation method (recall: it was 1/2 for the second order method)
     mask_for_one = torch.add(0.3333, mask_for_one, alpha=0.6667).type_as(masked_gates)
 
+    # from the sparsemixer paper, get the pi_i corresponding to selected expert
     multiplier_o = masked_gates.gather(dim=-1, index=selected_experts)
+    # forward (scores -> multiplier): multiplies multiplier_o by the mask_for_one (1 or 1/3)
+    # backward (dmultiplier/dscores): multiplies upstream gradient by multiplier_o, and
+    # returns the pi_i times negative upstream gradient, adding upstream gradient at selected experts' indices (??)
     multiplier = v2core.apply(
         scores, 
         multiplier_o, 
@@ -103,7 +121,7 @@ def sparsemixerv2_routing(scores, top_k, jitter_eps, training):
         masked_gates, 
         mask_for_one,
     )
-    
+
     ################ second expert ################
     if top_k > 1:
         # masked out first expert 
@@ -255,14 +273,22 @@ class SparseMixerRouter(nn.Module):
         noise = torch.rand(x.size(), dtype=x.dtype, device=x.device)
         return low + noise * (high - low)
 
-    def forward(self, x):
+    # x -> expert weights, expert indices
+    def forward(self, x, full=False):
+        # Multiplicative jitter sampled uniformly from [1-r, 1+r]
         if self.training and self.jitter_eps is not None:
             x = x * self.jitter(x)
 
         # x.view shape: (sl * bs, hs)...every token as a row
         # scores (float) shape: (sl * bs, num_experts)...expert rankings for every token
         logits = self.layer(x.view(-1, x.shape[-1]))
-        expert_weights, scores, expert_indices = sparsemixerv2_routing(logits, 1, self.jitter_eps, self.training)
+
+        if full:
+          scores = torch.softmax(logits, dim=-1)
+          # HACK select all experts
+          expert_weights, expert_indices = scores.topk(self.num_experts, dim=-1)
+        else:
+          expert_weights, scores, expert_indices = sparsemixerv2_routing(logits, 1, self.jitter_eps, self.training)
         with torch.no_grad():
             expert_indices_ft = expert_indices.flatten()
             tokens_per_expert = megablocks.ops.histogram(expert_indices_ft, self.num_experts)
@@ -275,16 +301,16 @@ class SparseMixerRouter(nn.Module):
         #     aux_loss = self.num_experts * torch.sum(pmean * f)
         
         # return sample, multiplier, balance_loss
-        routing_counts = torch.bincount(expert_indices.squeeze(1),minlength=self.num_experts)
-        global_routing_counts = torch.distributed.all_reduce(
-                routing_counts,
-                group=self.data_parallel_group,
-                op=torch.distributed.ReduceOp.SUM,
-                async_op=True,
-            )
-        global_routing_counts.wait()
+        # routing_counts = torch.bincount(expert_indices.squeeze(1),minlength=self.num_experts)
+        # global_routing_counts = torch.distributed.all_reduce(
+        #         routing_counts,
+        #         group=self.data_parallel_group,
+        #         op=torch.distributed.ReduceOp.SUM,
+        #         async_op=True,
+        #     )
+        # global_routing_counts.wait()
 
-        self.global_routing_counts = routing_counts
+        # self.global_routing_counts = routing_counts
 
         return expert_weights, expert_indices
 

@@ -169,7 +169,7 @@ class ParallelDroplessMLP(torch.nn.Module):
             top_k,
         )
 
-    def forward(self, x, expert_weights, expert_indices):
+    def forward(self, x, expert_weights, expert_indices, full=False):
         """
         grouped_forward_once
 
@@ -196,7 +196,7 @@ class ParallelDroplessMLP(torch.nn.Module):
             bin_ids,
             expert_weights,
             bins,
-            self.top_k,
+            self.top_k if not full else self.num_experts,
         )
 
         # restore input shape
@@ -243,6 +243,8 @@ class ParallelDroplessMoE(torch.nn.Module):
         else:
             raise ValueError(f"Invalid MoE Router type {neox_args.moe_router_type}")
 
+        self.full = False
+
         self.experts = ParallelDroplessMLP(
             neox_args,
             init_method,
@@ -259,7 +261,7 @@ class ParallelDroplessMoE(torch.nn.Module):
         x = cast_if_autocast_enabled(x)
 
         # Compute the expert scores and assignments
-        expert_weights, expert_indices = self.router(x)
+        expert_weights, expert_indices = self.router(x, full=self.full)
 
         # return value should be
-        return self.experts(x, expert_weights, expert_indices), None
+        return self.experts(x, expert_weights, expert_indices, full=self.full), None

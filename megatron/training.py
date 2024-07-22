@@ -60,6 +60,9 @@ from megatron.model.gpt2_model import cross_entropy
 from pickle import dump
 import os
 
+from pdb import set_trace
+import itertools
+from megatron.model.transformer import ParallelTransformerLayerPipe
 
 def mup_weights_reinit(neox_args, model):
     def has_method(o, name):
@@ -754,13 +757,13 @@ def backward_step(neox_args, timers, optimizer, model, loss):
         raise ValueError("Must be using deepspeed to run neox")
 
 
-def train_step(neox_args, timers, data_iterator, model, optimizer, lr_scheduler):
+def train_step(neox_args, timers, data_iterator, model, optimizer, lr_scheduler, mock_data_iterator):
     """Single training step."""
 
     # Pipeline parallelism schedules forward/backward/step
     if neox_args.is_pipe_parallel:
         reduced_loss = train_step_pipe(
-            neox_args=neox_args, timers=timers, model=model, data_iterator=data_iterator
+            neox_args=neox_args, timers=timers, model=model, data_iterator=data_iterator, mock_data_iterator=mock_data_iterator
         )
         if (
             neox_args.memory_profiling
@@ -844,10 +847,21 @@ def train_step(neox_args, timers, data_iterator, model, optimizer, lr_scheduler)
     return reduced_loss, skipped_iter
 
 
-def train_step_pipe(neox_args, timers, model, data_iterator):
+def train_step_pipe(neox_args, timers, model, data_iterator, mock_data_iterator):
     """Single training step with DeepSpeed's pipeline parallel engine."""
 
     assert neox_args.deepspeed
+
+    for child in model.module.children():
+        if isinstance(child, ParallelTransformerLayerPipe):
+            child.mlp.full = True
+
+    model.train_batch(data_iter=mock_data_iterator)
+
+    for child in model.module.children():
+        if isinstance(child, ParallelTransformerLayerPipe):
+            child.mlp.full = False
+    
     loss = model.train_batch(data_iter=data_iterator)
     loss_dict = {"lm_loss": loss}
     # Don't break Megatron's timers because we changed code paths.
@@ -876,6 +890,14 @@ def train(
 
     # Turn on training mode which enables dropout.
     model.train()
+    
+    train_data_iterator, mock_data_iterator = itertools.tee(train_data_iterator)
+    children = [child for child in model.module.children()]
+    children[2].saved_grad = None
+    def hook_fn(grad):
+        print(f'{children[2].mlp.full=}')
+        print(f'{grad.shape=}')
+    hook = children[2].mlp.router.layer.weight.register_hook(hook_fn)
 
     # Tracking loss.
     total_loss_dict = {}
@@ -922,6 +944,7 @@ def train(
             model=model,
             optimizer=optimizer,
             lr_scheduler=lr_scheduler,
+            mock_data_iterator=mock_data_iterator
         )
         if neox_args.profile and iteration == neox_args.profile_step_stop:
             torch.cuda.cudart().cudaProfilerStop()
