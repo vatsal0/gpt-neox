@@ -19,9 +19,7 @@ from megatron.mpu import gather_from_expert_model_parallel_region
 from megatron.neox_arguments.arguments import NeoXArgs
 
 from .moe_mlp import ParallelGroupedLLaMAMLP, ParallelGroupedMLP
-from .router import TopKTokenChoiceRouter, SinkhornRouter
-from .sparsemixer import SparseMixerRouter
-
+from .router import Router
 
 class ParallelDroplessMLP(torch.nn.Module):
     """
@@ -169,7 +167,7 @@ class ParallelDroplessMLP(torch.nn.Module):
             top_k,
         )
 
-    def forward(self, x, expert_weights, expert_indices):
+    def forward(self, x, expert_weights, expert_indices, router_type=None):
         """
         grouped_forward_once
 
@@ -196,7 +194,7 @@ class ParallelDroplessMLP(torch.nn.Module):
             bin_ids,
             expert_weights,
             bins,
-            self.top_k,
+            self.top_k if router_type != "dense" else self.num_experts,
         )
 
         # restore input shape
@@ -225,23 +223,7 @@ class ParallelDroplessMoE(torch.nn.Module):
     ):
         super(ParallelDroplessMoE, self).__init__()
 
-        if neox_args.moe_router_type == "sinkhorn":
-            self.router = SinkhornRouter(
-                neox_args,
-                init_method,
-            )
-        elif neox_args.moe_router_type == "topk":
-            self.router = TopKTokenChoiceRouter(
-                neox_args,
-                init_method,
-            )
-        elif neox_args.moe_router_type == "sparsemixer":
-            self.router = SparseMixerRouter(
-                neox_args,
-                init_method,
-            )
-        else:
-            raise ValueError(f"Invalid MoE Router type {neox_args.moe_router_type}")
+        self.router = Router(neox_args, init_method)
 
         self.experts = ParallelDroplessMLP(
             neox_args,
@@ -249,7 +231,7 @@ class ParallelDroplessMoE(torch.nn.Module):
             output_layer_init_method,
         )
 
-    def forward(self, x):
+    def forward(self, x, router_type=None):
         # we expect inputs as (sl, bs, hs)
         # neox provides inputs as torch.Size([2048, 4, 768])
         # (sl, bs, hs)
@@ -259,7 +241,7 @@ class ParallelDroplessMoE(torch.nn.Module):
         x = cast_if_autocast_enabled(x)
 
         # Compute the expert scores and assignments
-        expert_weights, expert_indices = self.router(x)
+        expert_weights, expert_indices = self.router(x, router_type=router_type)
 
         # return value should be
-        return self.experts(x, expert_weights, expert_indices), None
+        return self.experts(x, expert_weights, expert_indices, router_type=router_type), None

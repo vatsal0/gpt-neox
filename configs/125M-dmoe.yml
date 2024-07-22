@@ -17,7 +17,7 @@
 
    # moe settings
    "moe_num_experts": 4,
-   "moe_router_type": "sparsemixer",
+   "moe_router_type": "topk",
    "moe_jitter_eps": 0.01,
 
    # these should provide some speedup but takes a while to build, set to true if desired

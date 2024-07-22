@@ -1017,6 +1017,7 @@ class ParallelTransformerLayer(nn.Module):
             )
 
         self.layer_past = None  # used to cache k/v pairs in inference
+        self.router_grads = {}
 
     def _get_bias_dropout(self):
         if self.bias_dropout_fusion:
@@ -1117,6 +1118,16 @@ class ParallelTransformerLayer(nn.Module):
 
             # call signatures of both dense and MoE are the same
             mlp_output, mlp_bias = self.mlp(layernorm_output)
+
+            for router_type in ["topk", "sparsemixer", "dense"]:
+                with torch.enable_grad():
+                  _mlp_output, _mlp_bias = self.mlp(layernorm_output, router_type=router_type)
+                router_grads = torch.autograd.grad(
+                    outputs=_mlp_output, 
+                    inputs=self.mlp.router.layer.weight, 
+                    grad_outputs=torch.ones_like(_mlp_output)
+                )[0]
+                self.router_grads[router_type] = router_grads.cpu().flatten().float()
 
             with torch.enable_grad():
                 # dense llama MLP and MoE don't support bias

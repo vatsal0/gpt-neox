@@ -19,6 +19,9 @@ import torch
 
 from megatron.neox_arguments.arguments import NeoXArgs
 from megatron.mpu import get_model_parallel_group, get_model_parallel_rank
+import megablocks.ops
+
+from .sparsemixer import sparsemixerv2_routing, MoEAuxLossAutoScaler
 
 
 class SinkhornRouter(torch.nn.Module):
@@ -183,11 +186,7 @@ class SinkhornRouter(torch.nn.Module):
 
         return expert_weights, expert_indices
 
-
-class TopKTokenChoiceRouter(torch.nn.Module):
-    # TODO: how do we ensure that all copies of the router get the same
-    # initializations and stay in sync over time? Or is this handled by RNG seeding?
-
+class Router(torch.nn.Module):
     def __init__(
         self,
         neox_args: NeoXArgs,
@@ -197,11 +196,6 @@ class TopKTokenChoiceRouter(torch.nn.Module):
         self.jitter_eps = neox_args.moe_jitter_eps
         self.top_k = neox_args.moe_top_k
 
-        # Learned router parameters.
-        #
-        # NOTE: This weight matrix is not parallelized with expert tensor
-        # parallelism. Each device needs the entire router weight matrix
-        # so that it can route its batch of data correctly.
         self.layer = torch.nn.Linear(
             neox_args.hidden_size,
             neox_args.moe_num_experts,
@@ -211,63 +205,76 @@ class TopKTokenChoiceRouter(torch.nn.Module):
         )
         init_method(self.layer.weight)
 
+        self.num_experts = neox_args.moe_num_experts
+        self.router_type = neox_args.moe_router_type
+
     def jitter(self, x):
-        """
-        Apply jittering to the input tensor during training.
-
-        Args:
-            x (torch.Tensor): Input tensor.
-
-        Returns:
-            torch.Tensor: Jittered input tensor.
-        """
-        low = 1.0 - self.args.moe_jitter_eps
-        high = 1.0 + self.args.moe_jitter_eps
+        low = 1.0 - self.jitter_eps
+        high = 1.0 + self.jitter_eps
         noise = torch.rand(x.size(), dtype=x.dtype, device=x.device)
         return low + noise * (high - low)
-
+    
     def _top_k(self, scores):
-        """
-        Select the top-k experts based on input scores.
-
-        Args:
-            scores (torch.Tensor): Input scores from the router.
-                (sl * bs, num_experts)
-
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor]: Tuple containing expert weightings and indices of selected experts.
-
-
-        """
         if self.top_k == 1:
             return scores.max(dim=-1, keepdim=True)
         return torch.topk(scores, self.top_k, dim=-1)
+    
+    def switch_load_balancing_loss_func(self,
+        probs: torch.Tensor, tokens_per_expert: torch.Tensor, topk: int, moe_aux_loss_coeff: float
+    ):
+        num_tokens = probs.shape[0]
+        num_experts = probs.shape[1]
 
-    def forward(self, x):
-        """
-        Forward pass through the Learned Router.
+        aggregated_probs_per_expert = probs.sum(dim=0)
+        aux_loss = torch.sum(aggregated_probs_per_expert * tokens_per_expert) * (
+            num_experts * moe_aux_loss_coeff / (num_tokens * num_tokens * topk)
+        )
+        return aux_loss
 
-        Args:
-            x (torch.Tensor): Input tensor to be routed.
-                (sl, bs, hs)
-
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor]: Tuple containing
-                - expert_weights (sl * bs, top_k): Weights assigned to the selected experts
-                - expert_indices (sl * bs, top_k): Indices of the selected experts
-        """
+    def apply_load_balancing_loss(
+            self,
+            probs: torch.Tensor,
+            num_local_tokens_per_expert: torch.Tensor,
+            activation: torch.Tensor,
+        ):
+            moe_aux_loss_coeff = 0.1
+            
+            aux_loss = self.switch_load_balancing_loss_func(
+                probs, num_local_tokens_per_expert, self.top_k, moe_aux_loss_coeff
+            )
+            activation = MoEAuxLossAutoScaler.apply(activation, aux_loss)
+            
+            return activation
+    
+    def forward(self, x, router_type=None):
+        if router_type is None:
+            router_type = self.router_type
+        
         if self.training and self.jitter_eps is not None:
             x = x * self.jitter(x)
 
-        # x.view shape: (sl * bs, hs)...every token as a row
-        # scores (float) shape: (sl * bs, num_experts)...expert rankings for every token
-        scores = self.layer(x.view(-1, x.shape[-1])).softmax(dim=-1)
+        logits = self.layer(x.view(-1, x.shape[-1]))
+        
+        if router_type == "topk":
+            scores = logits.softmax(dim=-1)
+            expert_weights, expert_indices = self._top_k(scores)
+            with torch.no_grad():
+                expert_indices_ft = expert_indices.flatten()
+                tokens_per_expert = megablocks.ops.histogram(expert_indices_ft, self.num_experts)
+            expert_weights = self.apply_load_balancing_loss(scores, tokens_per_expert, activation=expert_weights)
+        
+        elif router_type == "sparsemixer":
+            expert_weights, scores, expert_indices = sparsemixerv2_routing(logits, 1, self.jitter_eps, self.training)
+            with torch.no_grad():
+                expert_indices_ft = expert_indices.flatten()
+                tokens_per_expert = megablocks.ops.histogram(expert_indices_ft, self.num_experts)
+            expert_weights = self.apply_load_balancing_loss(scores, tokens_per_expert, activation=expert_weights)
 
-        # expert_weights (float) shape: (sl * bs, top_k)...value(s) from scores corresponding to the top_k experts
-        # expert_indices (int) shape: (sl * bs, top_k)...index(indices) from scores corresponding to the top_k experts
-        expert_weights, expert_indices = self._top_k(scores)
-        # expert_weights probability mass won't add up to 1 because we took
-        # the topk scores from the softmax
-        # TODO: placeholder for moe_normalize_expert_weights if necessary
+        elif router_type == "dense":
+            scores = logits.softmax(dim=-1)
+            expert_weights, expert_indices = torch.topk(scores, self.num_experts, dim=-1)
+
+        else:
+            raise ValueError(f"Invalid MoE Router type {router_type}")
 
         return expert_weights, expert_indices
