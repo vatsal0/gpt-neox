@@ -213,10 +213,10 @@ def training_log(
     )
     children = [child for child in model.module.children()]
     router_grads = children[2].router_grads
-    for router_type in ["topk", "sparsemixer", "dense"]:
+    for router_type, grad in router_grads.items():
         tb_wandb_log(
             f'train/{router_type}_grad_norm_layer0',
-            torch.linalg.vector_norm(router_grads[router_type]),
+            torch.linalg.vector_norm(grad),
             iteration,
             use_wandb=neox_args.use_wandb,
             tensorboard_writer=neox_args.tensorboard_writer,
@@ -225,7 +225,7 @@ def training_log(
         if router_type != "dense":
             tb_wandb_log(
               f'train/{router_type}_dense_grad_sim_layer0',
-              torch.nn.functional.cosine_similarity(router_grads[router_type], router_grads['dense'], dim=0),
+              torch.nn.functional.cosine_similarity(grad, router_grads['dense'], dim=0),
               iteration,
               use_wandb=neox_args.use_wandb,
               tensorboard_writer=neox_args.tensorboard_writer,

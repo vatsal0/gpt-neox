@@ -21,6 +21,7 @@ from megatron.neox_arguments.arguments import NeoXArgs
 from .moe_mlp import ParallelGroupedLLaMAMLP, ParallelGroupedMLP
 from .router import Router
 
+
 class ParallelDroplessMLP(torch.nn.Module):
     """
     This class defines MoE expert computation, using tensor (model) parallel size as the expert parallel size
@@ -130,6 +131,7 @@ class ParallelDroplessMLP(torch.nn.Module):
         """
         # Route the tokens for MoE computation.
         ## stack (sl, bs, hs) into (sl * bs, hs)
+        seq_len, batch_size = input_.shape[0], input_.shape[1]
         input_ = input_.view(-1, input_.shape[-1])
 
         ## repeat each token top_k times and shuffle tokens to group them by their respective experts
@@ -156,6 +158,11 @@ class ParallelDroplessMLP(torch.nn.Module):
             output_parallel,
             tokens_per_expert,
         )
+        reshaped_output = torch.zeros((seq_len * batch_size * self.num_experts, output.size(-1))).to(output.device, dtype=output.dtype)
+        input_indices = indices // top_k
+        # ith element of output will be added to index corresponding to input index, and associated expert
+        reshaped_output.index_add_(dim=0, index=self.num_experts * input_indices + bin_ids, source=output)
+        self.expert_output = reshaped_output.view(seq_len * batch_size, self.num_experts, output.size(-1)).clone().detach()
 
         # Un-route the data for the MoE output
         return megablocks.ops.scatter(

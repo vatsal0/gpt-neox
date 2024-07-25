@@ -48,6 +48,7 @@ from megatron.model.fused_bias_dropout import (
 )
 from megatron.model.utils import configure_sparse_attention
 
+
 # flags required to enable jit fusion kernels
 torch._C._jit_set_profiling_mode(False)
 torch._C._jit_set_profiling_executor(False)
@@ -473,7 +474,6 @@ class ParallelSelfAttention(nn.Module):
         # Raw attention scores. [b, np, s, s]
         # ===================================
 
-        # [b, np, sq, sk]
         output_size = (
             query_layer.size(1),
             query_layer.size(2),
@@ -505,6 +505,7 @@ class ParallelSelfAttention(nn.Module):
 
         # change view to [b, np, sq, sk]
         attention_scores = matmul_result.view(*output_size)
+        self.attention_scores = attention_scores.clone().detach()
         # ==================================================
         # Update attention mask for inference. [b, np, sq, sk]
         # ==================================================
@@ -526,7 +527,6 @@ class ParallelSelfAttention(nn.Module):
         if self.pos_emb == "alibi":
             attention_scores = self.alibi_embed(attention_scores)
 
-        # attention scores and attention mask [b, np, sq, sk]
         attention_probs = self.scale_mask_softmax(attention_scores, attention_mask)
 
         # This is actually dropping out entire tokens to attend to, which might
@@ -807,7 +807,6 @@ class ParallelSelfAttention(nn.Module):
         # =====================
         # Query, Key, and Value
         # =====================
-
         if not self.gqa:
             # QKV projection for MHA.
 
@@ -920,7 +919,6 @@ class ParallelSelfAttention(nn.Module):
 
         if self.use_cache:
             output = [output, present]
-
         return output, bias
 
 
@@ -1085,7 +1083,6 @@ class ParallelTransformerLayer(nn.Module):
             # x = x + mlp(ln2(x))
 
             residual = x
-
             # x = x + attn(ln1(x))
             attention_output, attention_bias = self.attention(
                 self.input_layernorm(x), attention_mask, layer_past=layer_past
@@ -1128,6 +1125,71 @@ class ParallelTransformerLayer(nn.Module):
                     grad_outputs=torch.ones_like(_mlp_output)
                 )[0]
                 self.router_grads[router_type] = router_grads.cpu().flatten().float()
+
+                if router_type == "topk":
+                    routed_indices = self.mlp.router.expert_indices # sl*bs x k
+                    attention_scores = self.attention.attention_scores # bs x nh x sl x sl
+
+                    # sl*bs x n x hs
+                    # out of all sl*bs tokens, k out of n entries will be filled based on the experts that token was routed to
+                    # the rest will be 0
+                    expert_output = self.mlp.experts.expert_output
+
+                    # kinda like multihead attention but each head's attn map is the same and corresponds to diff experts
+                    # average across all heads, add back the head dimension, expand it to n experts
+                    attention_scores = attention_scores.mean(dim=1).unsqueeze(1).expand(-1, self.num_experts, -1, -1).clone()
+
+                    # sl*bs x n, select all at first
+                    notrouted_mask = torch.ones(routed_indices.size(0), self.num_experts).to(routed_indices.device, dtype=routed_indices.dtype)
+                    # now for each token, only non-routed expert indices will be selected (routed are set to 0)
+                    notrouted_mask.scatter_(1, routed_indices, 0)
+
+                    # sl x bs x n -> bs x n x sl. for each expert, mask will select the tokens that weren't routed to it
+                    notrouted_mask = notrouted_mask.view(attention_scores.size(2), attention_scores.size(0), self.num_experts).permute(1, 2, 0)
+                    # -> bs x n x [sl] x sl. expand across rows of attn map, so mask selects columns corresponding to non-routed tokens
+                    notrouted_mask = notrouted_mask.unsqueeze(2).expand(-1, -1, attention_scores.size(2), -1)
+                    # zero out the column logits corresponding to non-routed tokens
+                    # for each token, we only want similarity scores corresponding to tokens that were routed to that expert
+                    attention_scores.masked_fill_(notrouted_mask.bool(), torch.finfo(attention_scores.dtype).min)
+
+                    attention_probs = attention_scores.softmax(dim=-1)
+
+                    # sl*bs x n, select none then scatter to select routed expert indices for each token
+                    routed_mask = torch.zeros(routed_indices.size(0), self.num_experts).to(routed_indices.device, dtype=routed_indices.dtype)
+                    routed_mask.scatter_(1, routed_indices, 1)
+                    # for each expert, selects tokens that were routed to it, and expands across columns
+                    routed_mask = routed_mask.view(attention_scores.size(2), attention_scores.size(0), self.num_experts).permute(1, 2, 0)
+                    routed_mask = routed_mask.unsqueeze(3).expand(-1, -1, -1, attention_scores.size(3))
+                    # we only want value results from tokens that weren't routed 
+                    # (to estimate their outputs based on similarity to tokens that WERE routed)
+                    # so zero out rows for tokens that were routed
+                    attention_probs.masked_fill_(routed_mask.bool(), 0)
+
+                    # sl x bs x n x hs -> bs x n x sl x hs
+                    expert_output = expert_output.view(attention_probs.size(2), attention_probs.size(0), self.num_experts, -1).permute(1, 2, 0, 3)
+                    # yields bs x n x sl x hs
+                    notrouted_output = torch.bmm(attention_probs.view(-1, attention_probs.size(2), attention_probs.size(3)), expert_output.view(-1, expert_output.size(2), expert_output.size(3)))
+                    notrouted_output = notrouted_output.view(attention_probs.size(0), self.num_experts, expert_output.size(2), expert_output.size(3))
+
+                    # expert_output: values corresponding to not routed experts were 0. notrouted_output: values corresponding to routed were 0
+                    # now we have sl*bs x n x hs, for all tokens a true or approximated output for each expert
+                    combined_output = (expert_output + notrouted_output).permute(2, 0, 1, 3).view(-1, self.num_experts, expert_output.size(-1))
+
+                    # just so we don't have gradient flow from here to the weight matrix from the original calculations 
+                    combined_output = combined_output.detach()
+
+                    with torch.enable_grad():
+                        # bs*sl x n
+                        expert_weights = self.mlp.router.layer(layernorm_output.view(-1, layernorm_output.shape[-1])).softmax(dim=-1)
+                        # weighted average across experts, reshape bs x sl 
+                        _mlp_output = (expert_weights.unsqueeze(-1) * combined_output).sum(dim=1).view(layernorm_output.shape)
+
+                    router_grads = torch.autograd.grad(
+                        outputs=_mlp_output, 
+                        inputs=self.mlp.router.layer.weight, 
+                        grad_outputs=torch.ones_like(_mlp_output)
+                    )[0]
+                    self.router_grads["dense_approx"] = router_grads.cpu().flatten().float()
 
             with torch.enable_grad():
                 # dense llama MLP and MoE don't support bias
