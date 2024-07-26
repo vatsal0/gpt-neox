@@ -505,7 +505,7 @@ class ParallelSelfAttention(nn.Module):
 
         # change view to [b, np, sq, sk]
         attention_scores = matmul_result.view(*output_size)
-        self.attention_scores = attention_scores.clone().detach()
+        return_attention_scores = attention_scores.clone().detach()
         # ==================================================
         # Update attention mask for inference. [b, np, sq, sk]
         # ==================================================
@@ -564,7 +564,7 @@ class ParallelSelfAttention(nn.Module):
 
         # change view [b, np, sq, hn]
         context_layer = context_layer.view(*output_size)
-        return context_layer
+        return context_layer, return_attention_scores
 
     def flash_attention(self, query_layer, key_layer, value_layer):
         # [b, np, sq, sk]
@@ -891,10 +891,11 @@ class ParallelSelfAttention(nn.Module):
         if self.use_cache:
             present = torch.stack((key_layer, value_layer))
 
+        attention_scores = None
         if self.use_flash_attention:
             context_layer = self.flash_attention(query_layer, key_layer, value_layer)
         elif not self.sparse:
-            context_layer = self.attention(
+            context_layer, attention_scores = self.attention(
                 query_layer, key_layer, value_layer, layer_past, attention_mask
             )
         else:
@@ -919,7 +920,7 @@ class ParallelSelfAttention(nn.Module):
 
         if self.use_cache:
             output = [output, present]
-        return output, bias
+        return output, bias, attention_scores
 
 
 class ParallelTransformerLayer(nn.Module):
@@ -1084,7 +1085,7 @@ class ParallelTransformerLayer(nn.Module):
 
             residual = x
             # x = x + attn(ln1(x))
-            attention_output, attention_bias = self.attention(
+            attention_output, attention_bias, attention_scores = self.attention(
                 self.input_layernorm(x), attention_mask, layer_past=layer_past
             )
             if self.use_cache:
@@ -1118,7 +1119,7 @@ class ParallelTransformerLayer(nn.Module):
 
             for router_type in ["topk", "sparsemixer", "dense"]:
                 with torch.enable_grad():
-                  _mlp_output, _mlp_bias = self.mlp(layernorm_output, router_type=router_type)
+                  _mlp_output, expert_output, expert_indices = self.mlp(layernorm_output, router_type=router_type, return_intermediate=True)
                 router_grads = torch.autograd.grad(
                     outputs=_mlp_output, 
                     inputs=self.mlp.router.layer.weight, 
@@ -1127,22 +1128,20 @@ class ParallelTransformerLayer(nn.Module):
                 self.router_grads[router_type] = router_grads.cpu().flatten().float()
 
                 if router_type == "topk":
-                    routed_indices = self.mlp.router.expert_indices # sl*bs x k
-                    attention_scores = self.attention.attention_scores # bs x nh x sl x sl
-
-                    # sl*bs x n x hs
+                    # expert_indices: sl*bs x k
+                    # attention_scores: bs x nh x sl x sl
+                    # expert_output: sl*bs x n x hs
                     # out of all sl*bs tokens, k out of n entries will be filled based on the experts that token was routed to
                     # the rest will be 0
-                    expert_output = self.mlp.experts.expert_output
 
                     # kinda like multihead attention but each head's attn map is the same and corresponds to diff experts
                     # average across all heads, add back the head dimension, expand it to n experts
                     attention_scores = attention_scores.mean(dim=1).unsqueeze(1).expand(-1, self.num_experts, -1, -1).clone()
 
                     # sl*bs x n, select all at first
-                    notrouted_mask = torch.ones(routed_indices.size(0), self.num_experts).to(routed_indices.device, dtype=routed_indices.dtype)
+                    notrouted_mask = torch.ones(expert_indices.size(0), self.num_experts).to(expert_indices.device, dtype=expert_indices.dtype)
                     # now for each token, only non-routed expert indices will be selected (routed are set to 0)
-                    notrouted_mask.scatter_(1, routed_indices, 0)
+                    notrouted_mask.scatter_(1, expert_indices, 0)
 
                     # sl x bs x n -> bs x n x sl. for each expert, mask will select the tokens that weren't routed to it
                     notrouted_mask = notrouted_mask.view(attention_scores.size(2), attention_scores.size(0), self.num_experts).permute(1, 2, 0)
@@ -1155,8 +1154,8 @@ class ParallelTransformerLayer(nn.Module):
                     attention_probs = attention_scores.softmax(dim=-1)
 
                     # sl*bs x n, select none then scatter to select routed expert indices for each token
-                    routed_mask = torch.zeros(routed_indices.size(0), self.num_experts).to(routed_indices.device, dtype=routed_indices.dtype)
-                    routed_mask.scatter_(1, routed_indices, 1)
+                    routed_mask = torch.zeros(expert_indices.size(0), self.num_experts).to(expert_indices.device, dtype=expert_indices.dtype)
+                    routed_mask.scatter_(1, expert_indices, 1)
                     # for each expert, selects tokens that were routed to it, and expands across columns
                     routed_mask = routed_mask.view(attention_scores.size(2), attention_scores.size(0), self.num_experts).permute(1, 2, 0)
                     routed_mask = routed_mask.unsqueeze(3).expand(-1, -1, -1, attention_scores.size(3))

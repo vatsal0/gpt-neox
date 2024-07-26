@@ -159,10 +159,10 @@ class ParallelDroplessMLP(torch.nn.Module):
             tokens_per_expert,
         )
         reshaped_output = torch.zeros((seq_len * batch_size * self.num_experts, output.size(-1))).to(output.device, dtype=output.dtype)
+        # e.g. indices 0, 1, 2, 3 will all correspond to input 0 if top_k = 4
         input_indices = indices // top_k
         # ith element of output will be added to index corresponding to input index, and associated expert
         reshaped_output.index_add_(dim=0, index=self.num_experts * input_indices + bin_ids, source=output)
-        self.expert_output = reshaped_output.view(seq_len * batch_size, self.num_experts, output.size(-1)).clone().detach()
 
         # Un-route the data for the MoE output
         return megablocks.ops.scatter(
@@ -172,6 +172,10 @@ class ParallelDroplessMLP(torch.nn.Module):
             expert_weights,
             bins,
             top_k,
+        ), reshaped_output.view(
+            seq_len * batch_size, 
+            self.num_experts, 
+            output.size(-1)
         )
 
     def forward(self, x, expert_weights, expert_indices, router_type=None):
@@ -194,7 +198,7 @@ class ParallelDroplessMLP(torch.nn.Module):
                 expert_indices
             )
 
-        x = self.permute_and_compute(
+        x, expert_output = self.permute_and_compute(
             x,
             tokens_per_expert,
             indices,
@@ -206,7 +210,7 @@ class ParallelDroplessMLP(torch.nn.Module):
 
         # restore input shape
         x = x.view(in_shape)
-        return x
+        return x, expert_output
 
 
 def cast_if_autocast_enabled(tensor: torch.Tensor):
@@ -238,7 +242,7 @@ class ParallelDroplessMoE(torch.nn.Module):
             output_layer_init_method,
         )
 
-    def forward(self, x, router_type=None):
+    def forward(self, x, router_type=None, return_intermediate=False):
         # we expect inputs as (sl, bs, hs)
         # neox provides inputs as torch.Size([2048, 4, 768])
         # (sl, bs, hs)
@@ -251,4 +255,8 @@ class ParallelDroplessMoE(torch.nn.Module):
         expert_weights, expert_indices = self.router(x, router_type=router_type)
 
         # return value should be
-        return self.experts(x, expert_weights, expert_indices, router_type=router_type), None
+        output, expert_output = self.experts(x, expert_weights, expert_indices, router_type=router_type)
+        if return_intermediate:
+            return output, expert_output, expert_indices
+        else:
+          return output, None

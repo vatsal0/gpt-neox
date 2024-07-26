@@ -262,7 +262,6 @@ class Router(torch.nn.Module):
                 expert_indices_ft = expert_indices.flatten()
                 tokens_per_expert = megablocks.ops.histogram(expert_indices_ft, self.num_experts)
             expert_weights = self.apply_load_balancing_loss(scores, tokens_per_expert, activation=expert_weights)
-            self.expert_indices = expert_indices
         
         elif router_type == "sparsemixer":
             expert_weights, scores, expert_indices = sparsemixerv2_routing(logits, self.top_k, self.jitter_eps, self.training)
