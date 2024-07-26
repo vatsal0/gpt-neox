@@ -1139,30 +1139,22 @@ class ParallelTransformerLayer(nn.Module):
                     attention_scores = attention_scores.mean(dim=1).unsqueeze(1).expand(-1, self.num_experts, -1, -1).clone()
 
                     # sl*bs x n, select all at first
-                    notrouted_mask = torch.ones(expert_indices.size(0), self.num_experts).to(expert_indices.device, dtype=expert_indices.dtype)
+                    notrouted_mask = torch.ones(expert_indices.size(0), self.num_experts, dtype=torch.bool).to(expert_indices.device)
                     # now for each token, only non-routed expert indices will be selected (routed are set to 0)
                     notrouted_mask.scatter_(1, expert_indices, 0)
 
                     # sl x bs x n -> bs x n x sl. for each expert, mask will select the tokens that weren't routed to it
                     notrouted_mask = notrouted_mask.view(attention_scores.size(2), attention_scores.size(0), self.num_experts).permute(1, 2, 0)
-                    # -> bs x n x [sl] x sl. expand across rows of attn map, so mask selects columns corresponding to non-routed tokens
-                    notrouted_mask = notrouted_mask.unsqueeze(2).expand(-1, -1, attention_scores.size(2), -1)
                     # zero out the column logits corresponding to non-routed tokens
                     # for each token, we only want similarity scores corresponding to tokens that were routed to that expert
-                    attention_scores.masked_fill_(notrouted_mask.bool(), torch.finfo(attention_scores.dtype).min)
+                    attention_scores.masked_fill_(notrouted_mask.unsqueeze(2), torch.finfo(attention_scores.dtype).min)
 
                     attention_probs = attention_scores.softmax(dim=-1)
 
-                    # sl*bs x n, select none then scatter to select routed expert indices for each token
-                    routed_mask = torch.zeros(expert_indices.size(0), self.num_experts).to(expert_indices.device, dtype=expert_indices.dtype)
-                    routed_mask.scatter_(1, expert_indices, 1)
-                    # for each expert, selects tokens that were routed to it, and expands across columns
-                    routed_mask = routed_mask.view(attention_scores.size(2), attention_scores.size(0), self.num_experts).permute(1, 2, 0)
-                    routed_mask = routed_mask.unsqueeze(3).expand(-1, -1, -1, attention_scores.size(3))
                     # we only want value results from tokens that weren't routed 
                     # (to estimate their outputs based on similarity to tokens that WERE routed)
                     # so zero out rows for tokens that were routed
-                    attention_probs.masked_fill_(routed_mask.bool(), 0)
+                    attention_probs.masked_fill_(~notrouted_mask.unsqueeze(3), 0)
 
                     # sl x bs x n x hs -> bs x n x sl x hs
                     expert_output = expert_output.view(attention_probs.size(2), attention_probs.size(0), self.num_experts, -1).permute(1, 2, 0, 3)
