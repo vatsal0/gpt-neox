@@ -1017,6 +1017,7 @@ class ParallelTransformerLayer(nn.Module):
 
         self.layer_past = None  # used to cache k/v pairs in inference
         self.router_grads = {}
+        self.simulate_router_gradients = neox_args.simulate_router_gradients
 
     def _get_bias_dropout(self):
         if self.bias_dropout_fusion:
@@ -1115,72 +1116,18 @@ class ParallelTransformerLayer(nn.Module):
             layernorm_output = self.post_attention_layernorm(attention_output)
 
             # call signatures of both dense and MoE are the same
-            mlp_output, mlp_bias = self.mlp(layernorm_output)
+            mlp_output, mlp_bias = self.mlp(layernorm_output, attention_scores)
 
-            for router_type in ["topk", "sparsemixer", "dense"]:
-                with torch.enable_grad():
-                  _mlp_output, expert_output, expert_indices = self.mlp(layernorm_output, router_type=router_type, return_intermediate=True)
-                router_grads = torch.autograd.grad(
-                    outputs=_mlp_output, 
-                    inputs=self.mlp.router.layer.weight, 
-                    grad_outputs=torch.ones_like(_mlp_output)
-                )[0]
-                self.router_grads[router_type] = router_grads.cpu().flatten().float()
-
-                if router_type == "topk":
-                    # expert_indices: sl*bs x k
-                    # attention_scores: bs x nh x sl x sl
-                    # expert_output: sl*bs x n x hs
-                    # out of all sl*bs tokens, k out of n entries will be filled based on the experts that token was routed to
-                    # the rest will be 0
-
-                    # kinda like multihead attention but each head's attn map is the same and corresponds to diff experts
-                    # average across all heads, add back the head dimension, expand it to n experts
-                    attention_scores = attention_scores.mean(dim=1).unsqueeze(1).expand(-1, self.num_experts, -1, -1).clone()
-
-                    # sl*bs x n, select all at first
-                    notrouted_mask = torch.ones(expert_indices.size(0), self.num_experts, dtype=torch.bool).to(expert_indices.device)
-                    # now for each token, only non-routed expert indices will be selected (routed are set to 0)
-                    notrouted_mask.scatter_(1, expert_indices, 0)
-
-                    # sl x bs x n -> bs x n x sl. for each expert, mask will select the tokens that weren't routed to it
-                    notrouted_mask = notrouted_mask.view(attention_scores.size(2), attention_scores.size(0), self.num_experts).permute(1, 2, 0)
-                    # zero out the column logits corresponding to non-routed tokens
-                    # for each token, we only want similarity scores corresponding to tokens that were routed to that expert
-                    attention_scores.masked_fill_(notrouted_mask.unsqueeze(2), torch.finfo(attention_scores.dtype).min)
-
-                    attention_probs = attention_scores.softmax(dim=-1)
-
-                    # we only want value results from tokens that weren't routed 
-                    # (to estimate their outputs based on similarity to tokens that WERE routed)
-                    # so zero out rows for tokens that were routed
-                    attention_probs.masked_fill_(~notrouted_mask.unsqueeze(3), 0)
-
-                    # sl x bs x n x hs -> bs x n x sl x hs
-                    expert_output = expert_output.view(attention_probs.size(2), attention_probs.size(0), self.num_experts, -1).permute(1, 2, 0, 3)
-                    # yields bs x n x sl x hs
-                    notrouted_output = torch.bmm(attention_probs.view(-1, attention_probs.size(2), attention_probs.size(3)), expert_output.view(-1, expert_output.size(2), expert_output.size(3)))
-                    notrouted_output = notrouted_output.view(attention_probs.size(0), self.num_experts, expert_output.size(2), expert_output.size(3))
-
-                    # expert_output: values corresponding to not routed experts were 0. notrouted_output: values corresponding to routed were 0
-                    # now we have sl*bs x n x hs, for all tokens a true or approximated output for each expert
-                    combined_output = (expert_output + notrouted_output).permute(2, 0, 1, 3).view(-1, self.num_experts, expert_output.size(-1))
-
-                    # just so we don't have gradient flow from here to the weight matrix from the original calculations 
-                    combined_output = combined_output.detach()
-
+            if self.simulate_router_gradients:
+                for router_type in ["topk", "sparsemixer", "dense_approx", "dense"]:
                     with torch.enable_grad():
-                        # bs*sl x n
-                        expert_weights = self.mlp.router.layer(layernorm_output.view(-1, layernorm_output.shape[-1])).softmax(dim=-1)
-                        # weighted average across experts, reshape bs x sl 
-                        _mlp_output = (expert_weights.unsqueeze(-1) * combined_output).sum(dim=1).view(layernorm_output.shape)
-
+                      _mlp_output, _mlp_bias = self.mlp(layernorm_output, router_type_override=router_type)
                     router_grads = torch.autograd.grad(
                         outputs=_mlp_output, 
                         inputs=self.mlp.router.layer.weight, 
                         grad_outputs=torch.ones_like(_mlp_output)
                     )[0]
-                    self.router_grads["dense_approx"] = router_grads.cpu().flatten().float()
+                    self.router_grads[router_type] = router_grads.cpu().flatten().float()
 
             with torch.enable_grad():
                 # dense llama MLP and MoE don't support bias

@@ -15,6 +15,7 @@
 import sys
 
 import torch
+import re
 
 try:
     import wandb
@@ -139,6 +140,47 @@ def training_log(
 ):
     """Log training information such as losses, timing, etc."""
 
+    def get_max(max,new):
+        new_max = new.max().item()
+        max = new_max if max < new_max else max
+        return max 
+    
+    routing = {}
+    max_routed = 0
+    # max_per_layer = {}
+
+    if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+        for k,v in model.named_modules():
+            if k.endswith('.router'):
+                temp = v.global_routing_counts.cpu()
+                routing[k] = {'expert_'+str(i):x.item() for i,x in enumerate(temp)}
+                # max_per_layer[re.search(r'\d+',k,)] = temp.max()
+                max_routed = get_max(max_routed,temp)
+
+    # neox_args.world_size should be the global world size
+    balanced_tokens_per_exp = (neox_args.world_size * neox_args.seq_length * neox_args.train_micro_batch_size_per_gpu) / neox_args.moe_num_experts
+    max_routing_imbalance = max_routed / balanced_tokens_per_exp
+
+    tb_wandb_log(
+        f'train/max_routing_imbalance',
+        max_routing_imbalance,
+        iteration,
+        use_wandb=neox_args.use_wandb,
+        tensorboard_writer=neox_args.tensorboard_writer,
+    )
+    # max_per_layer = {k:v/balanced_tokens_per_exp for k,v in max_per_layer.items()}
+
+    for layer,v in routing.items():
+        for expert,tokens in v.items():
+            temp = re.search(r'\d+',layer,).group()
+            tb_wandb_log(
+                f'train/layer_{temp}/{expert}',
+                tokens,
+                iteration,
+                use_wandb=neox_args.use_wandb,
+                tensorboard_writer=neox_args.tensorboard_writer,
+            )
+
     # Update losses.
     skipped_iters_key = "skipped iterations"
     total_loss_dict[skipped_iters_key] = (
@@ -211,25 +253,28 @@ def training_log(
         use_wandb=neox_args.use_wandb,
         tensorboard_writer=neox_args.tensorboard_writer,
     )
-    children = [child for child in model.module.children()]
-    router_grads = children[2].router_grads
-    for router_type, grad in router_grads.items():
-        tb_wandb_log(
-            f'train/{router_type}_grad_norm_layer0',
-            torch.linalg.vector_norm(grad),
-            iteration,
-            use_wandb=neox_args.use_wandb,
-            tensorboard_writer=neox_args.tensorboard_writer,
-        )
 
-        if router_type != "dense":
+    if neox_args.simulate_router_gradients:
+        # does not work yet for multiple gpus :(
+        children = [child for child in model.module.children()]
+        router_grads = children[2].router_grads
+        for router_type, grad in router_grads.items():
             tb_wandb_log(
-              f'train/{router_type}_dense_grad_sim_layer0',
-              torch.nn.functional.cosine_similarity(grad, router_grads['dense'], dim=0),
-              iteration,
-              use_wandb=neox_args.use_wandb,
-              tensorboard_writer=neox_args.tensorboard_writer,
-          )
+                f'train/{router_type}_grad_norm_layer0',
+                torch.linalg.vector_norm(grad),
+                iteration,
+                use_wandb=neox_args.use_wandb,
+                tensorboard_writer=neox_args.tensorboard_writer,
+            )
+
+            if router_type != "dense":
+                tb_wandb_log(
+                  f'train/{router_type}_dense_grad_sim_layer0',
+                  torch.nn.functional.cosine_similarity(grad, router_grads['dense'], dim=0),
+                  iteration,
+                  use_wandb=neox_args.use_wandb,
+                  tensorboard_writer=neox_args.tensorboard_writer,
+              )
 
     for key in loss_dict:
         tb_wandb_log(
@@ -396,6 +441,13 @@ def training_log(
         log_string += " number of nan iterations: {:3d} |".format(
             total_loss_dict[got_nan_key]
         )
+
+        log_string += " max routing imbalance: {:2f} |".format(
+            max_routing_imbalance)
+
+        log_string += " max tokens routed: {:2f}/{} |".format(
+            max_routed,balanced_tokens_per_exp)
+
         total_loss_dict[skipped_iters_key] = 0
         total_loss_dict[got_nan_key] = 0
         print_rank_0(log_string)

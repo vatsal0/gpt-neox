@@ -17,8 +17,9 @@
 
    # moe settings
    "moe_num_experts": 4,
-   "moe_router_type": "topk",
+   "moe_router_type": "dense_approx",
    "moe_jitter_eps": 0.01,
+   "simulate_router_gradients": false,
 
    # these should provide some speedup but takes a while to build, set to true if desired
    "scaled_upper_triang_masked_softmax_fusion": false,
@@ -68,8 +69,8 @@
 
    "fp32_allreduce": True, # without a patch to torch, bf16 models have to do the allreduce in fp32
    # misc. training settings
-   "train_iters": 5000,
-   "lr_decay_iters": 5000,
+   "train_iters": 500000,
+   "lr_decay_iters": 500000,
    "distributed_backend": "nccl",
    "min_lr": 0.0006,
    "warmup": 0.0,

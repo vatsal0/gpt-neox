@@ -242,7 +242,7 @@ class ParallelDroplessMoE(torch.nn.Module):
             output_layer_init_method,
         )
 
-    def forward(self, x, router_type=None, return_intermediate=False):
+    def forward(self, x, attention_scores, router_type_override=None):
         # we expect inputs as (sl, bs, hs)
         # neox provides inputs as torch.Size([2048, 4, 768])
         # (sl, bs, hs)
@@ -252,11 +252,30 @@ class ParallelDroplessMoE(torch.nn.Module):
         x = cast_if_autocast_enabled(x)
 
         # Compute the expert scores and assignments
-        expert_weights, expert_indices = self.router(x, router_type=router_type)
+        expert_weights, expert_indices, scores = self.router(x, router_type_override=router_type_override)
 
         # return value should be
-        output, expert_output = self.experts(x, expert_weights, expert_indices, router_type=router_type)
-        if return_intermediate:
-            return output, expert_output, expert_indices
-        else:
-          return output, None
+        output, expert_output = self.experts(x, expert_weights, expert_indices)
+
+        if self.router.router_type == "dense_approx":
+          attention_scores = attention_scores.mean(dim=1).unsqueeze(1).expand(-1, self.experts.num_experts, -1, -1).clone()
+
+          notrouted_mask = torch.ones(expert_indices.size(0), self.experts.num_experts, dtype=torch.bool).to(expert_indices.device)
+          notrouted_mask.scatter_(1, expert_indices, 0)
+          notrouted_mask = notrouted_mask.view(attention_scores.size(2), attention_scores.size(0), self.experts.num_experts).permute(1, 2, 0)
+
+          attention_scores.masked_fill_(notrouted_mask.unsqueeze(2), torch.finfo(attention_scores.dtype).min)
+          attention_probs = attention_scores.softmax(dim=-1)
+          attention_probs.masked_fill_(~notrouted_mask.unsqueeze(3), 0)
+
+          expert_output = expert_output.view(attention_probs.size(2), attention_probs.size(0), self.experts.num_experts, -1).permute(1, 2, 0, 3)
+          notrouted_output = torch.bmm(attention_probs.view(-1, attention_probs.size(2), attention_probs.size(3)), expert_output.view(-1, expert_output.size(2), expert_output.size(3)))
+          notrouted_output = notrouted_output.view(attention_probs.size(0), self.experts.num_experts, expert_output.size(2), expert_output.size(3))
+
+          notrouted_output = notrouted_output.permute(2, 0, 1, 3).contiguous().view(-1, self.experts.num_experts, expert_output.size(-1))
+          # note notrouted_output is all 0 for indices corresponding to expert_indices, so those scores won't apply
+          approx_output = (scores.unsqueeze(-1) * notrouted_output).sum(dim=1).view(x.shape)
+
+          return output + approx_output - approx_output.detach(), None
+        
+        return output, None

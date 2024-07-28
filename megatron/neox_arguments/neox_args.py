@@ -1283,7 +1283,7 @@ class NeoXArgsMoE(NeoXArgsTemplate):
     The number of experts each token is routed to in MoE layers.
     """
 
-    moe_router_type: Literal["sinkhorn", "topk", "sparsemixer"] = "sinkhorn"
+    moe_router_type: Literal["sinkhorn", "topk", "sparsemixer", "dense_approx"] = "sinkhorn"
     """
     What token routing algorithm to use. Currently only sinkhorn is supported for training.
     TopK is only used for inference/eval.
@@ -1298,4 +1298,10 @@ class NeoXArgsMoE(NeoXArgsTemplate):
     """
     Coefficient for MoE routing jitter. Jitter is
     not used if set to None
+    """
+
+    simulate_router_gradients: bool = False
+    """
+    If True, simulates a forward pass through each router type to log what would be
+    the gradient compared to the dense gradient.
     """

@@ -18,7 +18,7 @@
 import torch
 
 from megatron.neox_arguments.arguments import NeoXArgs
-from megatron.mpu import get_model_parallel_group, get_model_parallel_rank
+from megatron.mpu import get_model_parallel_group, get_model_parallel_rank, get_data_parallel_group
 import megablocks.ops
 
 from .sparsemixer import sparsemixerv2_routing, MoEAuxLossAutoScaler
@@ -207,6 +207,7 @@ class Router(torch.nn.Module):
 
         self.num_experts = neox_args.moe_num_experts
         self.router_type = neox_args.moe_router_type
+        self.data_parallel_group = get_data_parallel_group()
 
     def jitter(self, x):
         low = 1.0 - self.jitter_eps
@@ -246,7 +247,9 @@ class Router(torch.nn.Module):
             
             return activation
     
-    def forward(self, x, router_type=None):
+    def forward(self, x, router_type_override=None):
+        router_type = router_type_override
+        
         if router_type is None:
             router_type = self.router_type
         
@@ -255,7 +258,7 @@ class Router(torch.nn.Module):
 
         logits = self.layer(x.view(-1, x.shape[-1]))
         
-        if router_type == "topk":
+        if router_type == "topk" or router_type == "dense_approx":
             scores = logits.softmax(dim=-1)
             expert_weights, expert_indices = self._top_k(scores)
             with torch.no_grad():
@@ -277,4 +280,17 @@ class Router(torch.nn.Module):
         else:
             raise ValueError(f"Invalid MoE Router type {router_type}")
 
-        return expert_weights, expert_indices
+        if router_type_override is None:
+          # only do this for the actual forward pass
+          routing_counts = torch.bincount(expert_indices.squeeze(1),minlength=self.num_experts)
+          global_routing_counts = torch.distributed.all_reduce(
+                  routing_counts,
+                  group=self.data_parallel_group,
+                  op=torch.distributed.ReduceOp.SUM,
+                  async_op=True,
+              )
+          global_routing_counts.wait()
+
+          self.global_routing_counts = routing_counts
+
+        return expert_weights, expert_indices, scores
