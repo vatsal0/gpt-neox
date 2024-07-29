@@ -208,6 +208,7 @@ class Router(torch.nn.Module):
         self.num_experts = neox_args.moe_num_experts
         self.router_type = neox_args.moe_router_type
         self.data_parallel_group = get_data_parallel_group()
+        self.load_balancing = neox_args.load_balancing
 
     def jitter(self, x):
         low = 1.0 - self.jitter_eps
@@ -261,17 +262,9 @@ class Router(torch.nn.Module):
         if router_type == "topk" or router_type == "dense_approx":
             scores = logits.softmax(dim=-1)
             expert_weights, expert_indices = self._top_k(scores)
-            with torch.no_grad():
-                expert_indices_ft = expert_indices.flatten()
-                tokens_per_expert = megablocks.ops.histogram(expert_indices_ft, self.num_experts)
-            expert_weights = self.apply_load_balancing_loss(scores, tokens_per_expert, activation=expert_weights)
         
         elif router_type == "sparsemixer":
             expert_weights, scores, expert_indices = sparsemixerv2_routing(logits, self.top_k, self.jitter_eps, self.training)
-            with torch.no_grad():
-                expert_indices_ft = expert_indices.flatten()
-                tokens_per_expert = megablocks.ops.histogram(expert_indices_ft, self.num_experts)
-            expert_weights = self.apply_load_balancing_loss(scores, tokens_per_expert, activation=expert_weights)
 
         elif router_type == "dense":
             scores = logits.softmax(dim=-1)
@@ -279,6 +272,12 @@ class Router(torch.nn.Module):
 
         else:
             raise ValueError(f"Invalid MoE Router type {router_type}")
+        
+        if self.load_balancing:
+            with torch.no_grad():
+                expert_indices_ft = expert_indices.flatten()
+                tokens_per_expert = megablocks.ops.histogram(expert_indices_ft, self.num_experts)
+            expert_weights = self.apply_load_balancing_loss(scores, tokens_per_expert, activation=expert_weights)
 
         if router_type_override is None:
           # only do this for the actual forward pass

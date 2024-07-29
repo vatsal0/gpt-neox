@@ -1305,3 +1305,8 @@ class NeoXArgsMoE(NeoXArgsTemplate):
     If True, simulates a forward pass through each router type to log what would be
     the gradient compared to the dense gradient.
     """
+
+    load_balancing: bool = True
+    """
+    Whether to apply the Switch Transformer's load balancing loss.
+    """
