@@ -146,6 +146,7 @@ def training_log(
         return max 
     
     routing = {}
+    approx_counts = {}
     max_routed = 0
     # max_per_layer = {}
 
@@ -156,6 +157,8 @@ def training_log(
                 routing[k] = {'expert_'+str(i):x.item() for i,x in enumerate(temp)}
                 # max_per_layer[re.search(r'\d+',k,)] = temp.max()
                 max_routed = get_max(max_routed,temp)
+            if k.endswith('.experts'):
+                approx_counts[k] = v.total_approx_count.cpu()
 
     # neox_args.world_size should be the global world size
     balanced_tokens_per_exp = (neox_args.world_size * neox_args.seq_length * neox_args.train_micro_batch_size_per_gpu) / neox_args.moe_num_experts
@@ -170,6 +173,15 @@ def training_log(
     )
     # max_per_layer = {k:v/balanced_tokens_per_exp for k,v in max_per_layer.items()}
 
+    for layer,v in approx_counts.items():
+        temp = re.search(r'\d+',layer,).group()
+        tb_wandb_log(
+            f'train/layer_{temp}/approx_counts',
+            v,
+            iteration,
+            use_wandb=neox_args.use_wandb,
+            tensorboard_writer=neox_args.tensorboard_writer,
+        )
     for layer,v in routing.items():
         for expert,tokens in v.items():
             temp = re.search(r'\d+',layer,).group()

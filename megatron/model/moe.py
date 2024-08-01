@@ -68,6 +68,8 @@ class ParallelDroplessMLP(torch.nn.Module):
         else:
             raise KeyError(neox_args.mlp_type)
 
+        self.total_approx_count = 0
+
     def indices_and_bins(self, top_expert: torch.Tensor):
         # Sort the expert ids to produce the scatter/gather
         # indices for the permutation.
@@ -168,9 +170,9 @@ class ParallelDroplessMLP(torch.nn.Module):
                 output.size(-1)
             )
 
-            nbits = 9
+            nbits = 10
             # the example here samples uniform [-0.5, 0.5] https://www.pinecone.io/learn/series/faiss/locality-sensitive-hashing-random-projection/
-            lsh_vectors = torch.rand((input_.shape[-1], nbits), dtype=input_.dtype, device=input_.device)
+            lsh_vectors = torch.rand((input_.shape[-1], nbits), dtype=input_.dtype, device=input_.device) - 0.5
             hash_vectors = torch.matmul(input_.detach(), lsh_vectors) > 0
 
             # since nbits is small, let's use tensor operations to turn each unique binary vector into an integer representation
@@ -194,25 +196,27 @@ class ParallelDroplessMLP(torch.nn.Module):
                 scores = torch.matmul(this_bucket_input / scale, this_bucket_input.T / scale)
 
                 # zero out similarities between same vector, or any below threshold
-                mask = torch.eye(scores.shape[0], dtype=torch.bool, device=scores.device).logical_or(scores < 0.5)
+                threshold = 1 - 2 / self.num_experts
+                mask = torch.eye(scores.shape[0], dtype=torch.bool, device=scores.device).logical_or(scores < threshold)
                 scores.masked_fill_(mask, 0)
 
                 scores = scores.repeat(self.num_experts, 1, 1)
-                # this is num_experts nxn matrices, of all 0, all 1, ... all num_experts-1. each entry represents the expert
-                expert_mask = torch.ones_like(scores, dtype=torch.int8) * torch.arange(4, device=scores.device).view(-1, 1, 1)
-
+                # broadcasting to nxn matrices, of all 0, all 1, ... all num_experts-1. each entry represents the expert
+                expert_range = torch.arange(4, device=scores.device).view(-1, 1, 1)
                 # for element i of this tensor, we want approximations for expert i, for tokens not routed to expert i, using similarities between tokens to expert i
                 # so if an entry's row matches the corresponding input's expert index (we don't want its value)
                 # or if an entry's column doesn't match the corresponding input's expert index (we don't want to use its score)
                 # set it to 0
-                expert_mask = torch.logical_or(expert_mask.eq(this_bucket_expert_indices.unsqueeze(1)), expert_mask.ne(this_bucket_expert_indices.unsqueeze(0)))
-                scores.masked_fill_(expert_mask, 0)
+                # two masked fills with num_experts x n x 1 and num_experts x 1 x n avoids materializing an n^2 mask
+                scores.masked_fill_(expert_range.eq(this_bucket_expert_indices.unsqueeze(1)), 0)
+                scores.masked_fill_(expert_range.ne(this_bucket_expert_indices.unsqueeze(0)), 0)
 
                 # matmul (which does a weighted sum), then divide by counts (to make it a weighted average)
                 score_counts = (scores > 0).sum(dim=-1)
 
                 approx = torch.matmul(scores, output[this_bucket_indices].detach())
                 approx[score_counts > 0] /= score_counts[score_counts > 0].unsqueeze(1)
+                self.total_approx_count += score_counts.sum()
 
                 reshaped_output[this_bucket_indices] = approx.transpose(0, 1)
         else:
@@ -342,5 +346,5 @@ class ParallelDroplessMoE(torch.nn.Module):
 
         if router_type == "dense_approx_lsh":
             approx_output = (scores.unsqueeze(-1) * expert_output).sum(dim=1).view(x.shape)
-            return output + approx_output - approx_output.detach(), None
+            return output + approx_output, None
         return output, None
