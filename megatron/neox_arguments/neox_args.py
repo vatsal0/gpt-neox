@@ -1283,7 +1283,7 @@ class NeoXArgsMoE(NeoXArgsTemplate):
     The number of experts each token is routed to in MoE layers.
     """
 
-    moe_router_type: Literal["sinkhorn", "topk", "sparsemixer", "dense_approx"] = "sinkhorn"
+    moe_router_type: Literal["sinkhorn", "topk", "sparsemixer", "dense_approx", "dense_approx_lsh"] = "sinkhorn"
     """
     What token routing algorithm to use. Currently only sinkhorn is supported for training.
     TopK is only used for inference/eval.

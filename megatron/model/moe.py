@@ -100,6 +100,7 @@ class ParallelDroplessMLP(torch.nn.Module):
         expert_weights: torch.Tensor,
         bins: torch.Tensor,
         top_k: int,
+        add_lsh_approx=False
     ):
         """
         grouped_permute_and_compute
@@ -159,10 +160,66 @@ class ParallelDroplessMLP(torch.nn.Module):
             tokens_per_expert,
         )
         reshaped_output = torch.zeros((seq_len * batch_size * self.num_experts, output.size(-1))).to(output.device, dtype=output.dtype)
-        # e.g. indices 0, 1, 2, 3 will all correspond to input 0 if top_k = 4
-        input_indices = indices // top_k
-        # ith element of output will be added to index corresponding to input index, and associated expert
-        reshaped_output.index_add_(dim=0, index=self.num_experts * input_indices + bin_ids, source=output)
+
+        if add_lsh_approx:
+            reshaped_output = reshaped_output.view(
+                seq_len * batch_size, 
+                self.num_experts, 
+                output.size(-1)
+            )
+
+            nbits = 9
+            # the example here samples uniform [-0.5, 0.5] https://www.pinecone.io/learn/series/faiss/locality-sensitive-hashing-random-projection/
+            lsh_vectors = torch.rand((input_.shape[-1], nbits), dtype=input_.dtype, device=input_.device)
+            hash_vectors = torch.matmul(input_.detach(), lsh_vectors) > 0
+
+            # since nbits is small, let's use tensor operations to turn each unique binary vector into an integer representation
+            exponents = 2 ** torch.arange(nbits - 1, -1, -1).to(hash_vectors.device)
+            hashes = torch.sum(exponents * hash_vectors, -1)
+
+            # get buckets for all vectors
+            bucket_ids, bucket_indices = megablocks.ops.sort(hashes, nbits)
+            bucket_counts = megablocks.ops.histogram(hashes, 2**nbits)
+            bucket_ends = megablocks.ops.inclusive_cumsum(bucket_counts, 0)
+
+            scale = np.sqrt(input_.shape[-1])
+            for i in range(2**nbits):
+                bucket_start = bucket_ends[i - 1] % bucket_ends[-1]
+                bucket_end = bucket_ends[i]
+                this_bucket_indices = bucket_indices[bucket_start : bucket_end]
+
+                this_bucket_input = input_[this_bucket_indices].detach()
+                this_bucket_expert_indices = bin_ids[this_bucket_indices]
+
+                scores = torch.matmul(this_bucket_input / scale, this_bucket_input.T / scale)
+
+                # zero out similarities between same vector, or any below threshold
+                mask = torch.eye(scores.shape[0], dtype=torch.bool, device=scores.device).logical_or(scores < 0.5)
+                scores.masked_fill_(mask, 0)
+
+                scores = scores.repeat(self.num_experts, 1, 1)
+                # this is num_experts nxn matrices, of all 0, all 1, ... all num_experts-1. each entry represents the expert
+                expert_mask = torch.ones_like(scores, dtype=torch.int8) * torch.arange(4, device=scores.device).view(-1, 1, 1)
+
+                # for element i of this tensor, we want approximations for expert i, for tokens not routed to expert i, using similarities between tokens to expert i
+                # so if an entry's row matches the corresponding input's expert index (we don't want its value)
+                # or if an entry's column doesn't match the corresponding input's expert index (we don't want to use its score)
+                # set it to 0
+                expert_mask = torch.logical_or(expert_mask.eq(this_bucket_expert_indices.unsqueeze(1)), expert_mask.ne(this_bucket_expert_indices.unsqueeze(0)))
+                scores.masked_fill_(expert_mask, 0)
+
+                # matmul (which does a weighted sum), then divide by counts (to make it a weighted average)
+                score_counts = (scores > 0).sum(dim=-1)
+
+                approx = torch.matmul(scores, output[this_bucket_indices].detach())
+                approx[score_counts > 0] /= score_counts[score_counts > 0].unsqueeze(1)
+
+                reshaped_output[this_bucket_indices] = approx.transpose(0, 1)
+        else:
+          # e.g. indices 0, 1, 2, 3 will all correspond to input 0 if top_k = 4
+          input_indices = indices // top_k
+          # ith element of output will be added to index corresponding to input index, and associated expert
+          reshaped_output.index_add_(dim=0, index=self.num_experts * input_indices + bin_ids, source=output)
 
         # Un-route the data for the MoE output
         return megablocks.ops.scatter(
@@ -206,6 +263,7 @@ class ParallelDroplessMLP(torch.nn.Module):
             expert_weights,
             bins,
             self.top_k if router_type != "dense" else self.num_experts,
+            add_lsh_approx=(router_type=="dense_approx_lsh")
         )
 
         # restore input shape
@@ -243,6 +301,10 @@ class ParallelDroplessMoE(torch.nn.Module):
         )
 
     def forward(self, x, attention_scores, router_type_override=None):
+        router_type = router_type_override
+        
+        if router_type is None:
+            router_type = self.router.router_type
         # we expect inputs as (sl, bs, hs)
         # neox provides inputs as torch.Size([2048, 4, 768])
         # (sl, bs, hs)
@@ -255,9 +317,9 @@ class ParallelDroplessMoE(torch.nn.Module):
         expert_weights, expert_indices, scores = self.router(x, router_type_override=router_type_override)
 
         # return value should be
-        output, expert_output = self.experts(x, expert_weights, expert_indices)
+        output, expert_output = self.experts(x, expert_weights, expert_indices, router_type=router_type)
 
-        if self.router.router_type == "dense_approx":
+        if router_type == "dense_approx":
           attention_scores = attention_scores.mean(dim=1).unsqueeze(1).expand(-1, self.experts.num_experts, -1, -1).clone()
 
           notrouted_mask = torch.ones(expert_indices.size(0), self.experts.num_experts, dtype=torch.bool).to(expert_indices.device)
@@ -277,5 +339,8 @@ class ParallelDroplessMoE(torch.nn.Module):
           approx_output = (scores.unsqueeze(-1) * notrouted_output).sum(dim=1).view(x.shape)
 
           return output + approx_output - approx_output.detach(), None
-        
+
+        if router_type == "dense_approx_lsh":
+            approx_output = (scores.unsqueeze(-1) * expert_output).sum(dim=1).view(x.shape)
+            return output + approx_output - approx_output.detach(), None
         return output, None
