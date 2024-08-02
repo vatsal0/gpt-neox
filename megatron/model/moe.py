@@ -216,7 +216,7 @@ class ParallelDroplessMLP(torch.nn.Module):
 
                 approx = torch.matmul(scores, output[this_bucket_indices].detach())
                 approx[score_counts > 0] /= score_counts[score_counts > 0].unsqueeze(1)
-                self.total_approx_count += score_counts.sum()
+                self.total_approx_count += (score_counts > 0).sum()
 
                 reshaped_output[this_bucket_indices] = approx.transpose(0, 1)
         else:
