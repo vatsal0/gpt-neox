@@ -21,6 +21,11 @@ from megatron.neox_arguments.arguments import NeoXArgs
 from .moe_mlp import ParallelGroupedLLaMAMLP, ParallelGroupedMLP
 from .router import Router
 
+from .lsh_triton import launch_lsh_approximation_kernel
+print('start compiling')
+kernel = torch.compile(launch_lsh_approximation_kernel)
+print('done compiling')
+
 
 class ParallelDroplessMLP(torch.nn.Module):
     """
@@ -185,6 +190,14 @@ class ParallelDroplessMLP(torch.nn.Module):
             bucket_ends = megablocks.ops.inclusive_cumsum(bucket_counts, 0)
 
             scale = np.sqrt(input_.shape[-1])
+
+            bucket_starts = bucket_ends.roll(1) % bucket_ends[-1]
+
+            # from pdb import set_trace
+            # set_trace()
+
+            kernel(input_, output, bin_ids, bucket_indices, bucket_starts, bucket_ends, reshaped_output, self.num_experts, 2**nbits)
+            
             for i in range(2**nbits):
                 bucket_start = bucket_ends[i - 1] % bucket_ends[-1]
                 bucket_end = bucket_ends[i]
@@ -342,7 +355,7 @@ class ParallelDroplessMoE(torch.nn.Module):
           # note notrouted_output is all 0 for indices corresponding to expert_indices, so those scores won't apply
           approx_output = (scores.unsqueeze(-1) * notrouted_output).sum(dim=1).view(x.shape)
 
-          return output + approx_output - approx_output.detach(), None
+          return output + approx_output, None
 
         if router_type == "dense_approx_lsh":
             approx_output = (scores.unsqueeze(-1) * expert_output).sum(dim=1).view(x.shape)
