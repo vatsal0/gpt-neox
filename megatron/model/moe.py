@@ -26,6 +26,8 @@ print('start compiling')
 kernel = torch.compile(launch_lsh_approximation_kernel)
 print('done compiling')
 
+from xformers.components.attention import ScaledDotProduct
+
 
 class ParallelDroplessMLP(torch.nn.Module):
     """
@@ -107,7 +109,9 @@ class ParallelDroplessMLP(torch.nn.Module):
         expert_weights: torch.Tensor,
         bins: torch.Tensor,
         top_k: int,
-        add_lsh_approx=False
+        router_type: str,
+        queries=None,
+        keys=None
     ):
         """
         grouped_permute_and_compute
@@ -167,8 +171,10 @@ class ParallelDroplessMLP(torch.nn.Module):
             tokens_per_expert,
         )
         reshaped_output = torch.zeros((seq_len * batch_size * self.num_experts, output.size(-1))).to(output.device, dtype=output.dtype)
+        # e.g. indices 0, 1, 2, 3 will all correspond to input 0 if top_k = 4
+        input_indices = indices // top_k
 
-        if add_lsh_approx:
+        if router_type == "dense_approx_lsh":
             reshaped_output = reshaped_output.view(
                 seq_len * batch_size, 
                 self.num_experts, 
@@ -196,7 +202,7 @@ class ParallelDroplessMLP(torch.nn.Module):
             # from pdb import set_trace
             # set_trace()
 
-            kernel(input_, output, bin_ids, bucket_indices, bucket_starts, bucket_ends, reshaped_output, self.num_experts, 2**nbits)
+            launch_lsh_approximation_kernel(input_, output, bin_ids, bucket_indices, bucket_starts, bucket_ends, reshaped_output, self.num_experts, 2**nbits)
             
             for i in range(2**nbits):
                 bucket_start = bucket_ends[i - 1] % bucket_ends[-1]
@@ -233,8 +239,6 @@ class ParallelDroplessMLP(torch.nn.Module):
 
                 reshaped_output[this_bucket_indices] = approx.transpose(0, 1)
         else:
-          # e.g. indices 0, 1, 2, 3 will all correspond to input 0 if top_k = 4
-          input_indices = indices // top_k
           # ith element of output will be added to index corresponding to input index, and associated expert
           reshaped_output.index_add_(dim=0, index=self.num_experts * input_indices + bin_ids, source=output)
 
@@ -252,7 +256,7 @@ class ParallelDroplessMLP(torch.nn.Module):
             output.size(-1)
         )
 
-    def forward(self, x, expert_weights, expert_indices, router_type=None):
+    def forward(self, x, expert_weights, expert_indices, queries=None, keys=None, router_type=None):
         """
         grouped_forward_once
 
@@ -280,7 +284,9 @@ class ParallelDroplessMLP(torch.nn.Module):
             expert_weights,
             bins,
             self.top_k if router_type != "dense" else self.num_experts,
-            add_lsh_approx=(router_type=="dense_approx_lsh")
+            router_type,
+            queries=queries,
+            keys=keys
         )
 
         # restore input shape
@@ -317,7 +323,9 @@ class ParallelDroplessMoE(torch.nn.Module):
             output_layer_init_method,
         )
 
-    def forward(self, x, attention_scores, router_type_override=None):
+        self.attention = ScaledDotProduct().cuda()
+
+    def forward(self, x, attention_scores, queries=None, keys=None, router_type_override=None):
         router_type = router_type_override
         
         if router_type is None:
@@ -334,7 +342,7 @@ class ParallelDroplessMoE(torch.nn.Module):
         expert_weights, expert_indices, scores = self.router(x, router_type_override=router_type_override)
 
         # return value should be
-        output, expert_output = self.experts(x, expert_weights, expert_indices, router_type=router_type)
+        output, expert_output = self.experts(x, expert_weights, expert_indices, queries=queries, keys=keys, router_type=router_type)
 
         if router_type == "dense_approx":
           attention_scores = attention_scores.mean(dim=1).unsqueeze(1).expand(-1, self.experts.num_experts, -1, -1).clone()
@@ -360,4 +368,37 @@ class ParallelDroplessMoE(torch.nn.Module):
         if router_type == "dense_approx_lsh":
             approx_output = (scores.unsqueeze(-1) * expert_output).sum(dim=1).view(x.shape)
             return output + approx_output, None
+        
+        if router_type == "dense_approx_efficient":
+            routed_mask = torch.zeros(expert_indices.size(0), self.experts.num_experts, dtype=torch.bool).to(expert_indices.device)
+            routed_mask.scatter_(1, expert_indices, 1)
+
+            # sl*bs x nexperts -> bs x nexperts x 1 x sl
+            att_mask = routed_mask.view(queries.shape[1], queries.shape[0], -1).transpose(0, 1).transpose(1, 2)
+            
+            attn_result = self.attention(
+                # bs x sl x nheads x head dim -> bs x nexperts x sl x head dim
+                queries.mean(dim=2, keepdim=True).expand(-1, -1, self.experts.num_experts, -1).transpose(1, 2),
+                # bs x sl x nheads x head dim -> bs x nexperts x sl x head dim
+                keys.mean(dim=2, keepdim=True).expand(-1, -1, self.experts.num_experts, -1).transpose(1, 2), 
+                # sl*bs x nexperts x hidden dim -> bs x nexperts x sl x hidden dim
+                expert_output.view(queries.shape[1], queries.shape[0], self.experts.num_experts, -1).transpose(0, 1).transpose(1, 2),
+                # select columns of routed tokens
+                att_mask=att_mask.unsqueeze(2)
+            )
+            # -> bs x nexperts x sl x hidden dim
+            # remove value rows of routed tokens
+            # rarely a whole sequence can be masked out (all tokens routed to that expert) resulting in nans
+            # in either case mask out approximations
+            attn_result = torch.where(torch.logical_or(att_mask.unsqueeze(3), torch.isnan(attn_result)), 0, attn_result)
+
+            approx_output = (scores.view(*x.shape[:2], -1).unsqueeze(-1) * attn_result.transpose(1, 2).transpose(0, 1)).sum(dim=2)
+
+            return output + approx_output, None
+
+        if router_type == "expert_prob_approx":
+            # for expert 0
+            # get all inputs that didn't go expert 0
+            # get highest probs to expert 0, grouped by expert
+            pass
         return output, None

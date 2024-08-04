@@ -259,7 +259,7 @@ class Router(torch.nn.Module):
 
         logits = self.layer(x.view(-1, x.shape[-1]))
         
-        if router_type == "topk" or router_type == "dense_approx" or router_type == "dense_approx_lsh":
+        if router_type == "topk" or router_type == "dense_approx" or router_type == "dense_approx_lsh" or router_type == "dense_approx_efficient":
             scores = logits.softmax(dim=-1)
             expert_weights, expert_indices = self._top_k(scores)
         

@@ -158,7 +158,7 @@ def training_log(
                 # max_per_layer[re.search(r'\d+',k,)] = temp.max()
                 max_routed = get_max(max_routed,temp)
             if k.endswith('.experts'):
-                approx_counts[k] = v.total_approx_count.cpu()
+                approx_counts[k] = v.total_approx_count
 
     # neox_args.world_size should be the global world size
     balanced_tokens_per_exp = (neox_args.world_size * neox_args.seq_length * neox_args.train_micro_batch_size_per_gpu) / neox_args.moe_num_experts

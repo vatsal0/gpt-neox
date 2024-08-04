@@ -683,7 +683,7 @@ class ParallelSelfAttention(nn.Module):
             )
             matmul_result = matmul_result.transpose(1, 2)
 
-        return matmul_result
+        return matmul_result, query_layer.detach(), key_layer.detach()
 
     def sparse_attention(self, query_layer, key_layer, value_layer, attention_mask):
         # TODO: sparse attn dropout?
@@ -892,8 +892,10 @@ class ParallelSelfAttention(nn.Module):
             present = torch.stack((key_layer, value_layer))
 
         attention_scores = None
+        queries = None
+        keys = None
         if self.use_flash_attention:
-            context_layer = self.flash_attention(query_layer, key_layer, value_layer)
+            context_layer, queries, keys = self.flash_attention(query_layer, key_layer, value_layer)
         elif not self.sparse:
             context_layer, attention_scores = self.attention(
                 query_layer, key_layer, value_layer, layer_past, attention_mask
@@ -920,7 +922,7 @@ class ParallelSelfAttention(nn.Module):
 
         if self.use_cache:
             output = [output, present]
-        return output, bias, attention_scores
+        return output, bias, attention_scores, queries, keys
 
 
 class ParallelTransformerLayer(nn.Module):
@@ -1086,7 +1088,7 @@ class ParallelTransformerLayer(nn.Module):
 
             residual = x
             # x = x + attn(ln1(x))
-            attention_output, attention_bias, attention_scores = self.attention(
+            attention_output, attention_bias, attention_scores, queries, keys = self.attention(
                 self.input_layernorm(x), attention_mask, layer_past=layer_past
             )
             if self.use_cache:
@@ -1116,7 +1118,7 @@ class ParallelTransformerLayer(nn.Module):
             layernorm_output = self.post_attention_layernorm(attention_output)
 
             # call signatures of both dense and MoE are the same
-            mlp_output, mlp_bias = self.mlp(layernorm_output, attention_scores)
+            mlp_output, mlp_bias = self.mlp(layernorm_output, attention_scores, queries=queries, keys=keys)
 
             if self.simulate_router_gradients:
                 for router_type in ["topk", "sparsemixer", "dense_approx", "dense"]:
