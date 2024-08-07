@@ -76,7 +76,6 @@ class ParallelDroplessMLP(torch.nn.Module):
             raise KeyError(neox_args.mlp_type)
 
         self.total_approx_count = 0
-        self.attention = ScaledDotProduct().cuda()
 
     def indices_and_bins(self, top_expert: torch.Tensor):
         # Sort the expert ids to produce the scatter/gather
@@ -111,7 +110,6 @@ class ParallelDroplessMLP(torch.nn.Module):
         bins: torch.Tensor,
         top_k: int,
         router_type: str,
-        scores: torch.Tensor,
         queries=None,
         keys=None
     ):
@@ -172,49 +170,16 @@ class ParallelDroplessMLP(torch.nn.Module):
             output_parallel,
             tokens_per_expert,
         )
+        reshaped_output = torch.zeros((seq_len * batch_size * self.num_experts, output.size(-1))).to(output.device, dtype=output.dtype)
         # e.g. indices 0, 1, 2, 3 will all correspond to input 0 if top_k = 4
         input_indices = indices // top_k
 
-        scattered_output = megablocks.ops.scatter(
-            output,
-            indices,
-            bin_ids,
-            expert_weights,
-            bins,
-            top_k,
-        )
-
-        if router_type == "dense_approx_efficient":
-            assert top_k == 1
-            # bs x sl x nheads x headdim -> sl*bs x headdim
-            queries = queries.transpose(0, 1).view(-1, *queries.shape[2:]).mean(dim=1).detach()
-            keys = keys.transpose(0, 1).view(-1, *keys.shape[2:]).mean(dim=1).detach()
-
-            for expert in range(self.num_experts):
-                # only use keys from inputs routed to this expert
-                mask = bin_ids == expert
-                attn_result = self.attention(
-                    queries[input_indices].unsqueeze(0), 
-                    keys[input_indices].unsqueeze(0), 
-                    output.unsqueeze(0), 
-                    mask.unsqueeze(0))
-                attn_result = attn_result.squeeze(0)
-
-                # zero out approximations for inputs routed to this expert
-                attn_result.masked_fill_(mask.unsqueeze(1), 0)
-                
-                # scatter the approximations the same way,
-                # but instead of top expert weight use the weight for expert 0 every time
-                scattered_output += megablocks.ops.scatter(
-                    attn_result, 
-                    indices, 
-                    bin_ids, 
-                    torch.where(mask, 0, scores[:, 0]), 
-                    bins, 
-                    top_k
-                )
-
         if router_type == "dense_approx_lsh":
+            reshaped_output = reshaped_output.view(
+                seq_len * batch_size, 
+                self.num_experts, 
+                output.size(-1)
+            )
 
             nbits = 10
             # the example here samples uniform [-0.5, 0.5] https://www.pinecone.io/learn/series/faiss/locality-sensitive-hashing-random-projection/
@@ -237,7 +202,7 @@ class ParallelDroplessMLP(torch.nn.Module):
             # from pdb import set_trace
             # set_trace()
 
-            # kernel(input_, output, bin_ids, bucket_indices, bucket_starts, bucket_ends, reshaped_output, self.num_experts, 2**nbits)
+            launch_lsh_approximation_kernel(input_, output, bin_ids, bucket_indices, bucket_starts, bucket_ends, reshaped_output, self.num_experts, 2**nbits)
             
             for i in range(2**nbits):
                 bucket_start = bucket_ends[i - 1] % bucket_ends[-1]
@@ -272,15 +237,26 @@ class ParallelDroplessMLP(torch.nn.Module):
                 approx[score_counts > 0] /= score_counts[score_counts > 0].unsqueeze(1)
                 self.total_approx_count += (score_counts > 0).sum()
 
-                # reshaped_output[this_bucket_indices] = approx.transpose(0, 1)
+                reshaped_output[this_bucket_indices] = approx.transpose(0, 1)
         else:
           # ith element of output will be added to index corresponding to input index, and associated expert
-          pass
+          reshaped_output.index_add_(dim=0, index=self.num_experts * input_indices + bin_ids, source=output)
 
         # Un-route the data for the MoE output
-        return scattered_output
+        return megablocks.ops.scatter(
+            output,
+            indices,
+            bin_ids,
+            expert_weights,
+            bins,
+            top_k,
+        ), reshaped_output.view(
+            seq_len * batch_size, 
+            self.num_experts, 
+            output.size(-1)
+        )
 
-    def forward(self, x, expert_weights, expert_indices, scores, queries=None, keys=None, router_type=None):
+    def forward(self, x, expert_weights, expert_indices, queries=None, keys=None, router_type=None):
         """
         grouped_forward_once
 
@@ -300,7 +276,7 @@ class ParallelDroplessMLP(torch.nn.Module):
                 expert_indices
             )
 
-        x = self.permute_and_compute(
+        x, expert_output = self.permute_and_compute(
             x,
             tokens_per_expert,
             indices,
@@ -309,14 +285,13 @@ class ParallelDroplessMLP(torch.nn.Module):
             bins,
             self.top_k if router_type != "dense" else self.num_experts,
             router_type,
-            scores,
             queries=queries,
             keys=keys
         )
 
         # restore input shape
         x = x.view(in_shape)
-        return x
+        return x, expert_output
 
 
 def cast_if_autocast_enabled(tensor: torch.Tensor):
@@ -348,6 +323,8 @@ class ParallelDroplessMoE(torch.nn.Module):
             output_layer_init_method,
         )
 
+        self.attention = ScaledDotProduct().cuda()
+
     def forward(self, x, attention_scores, queries=None, keys=None, router_type_override=None):
         router_type = router_type_override
         
@@ -365,9 +342,7 @@ class ParallelDroplessMoE(torch.nn.Module):
         expert_weights, expert_indices, scores = self.router(x, router_type_override=router_type_override)
 
         # return value should be
-        output = self.experts(x, expert_weights, expert_indices, scores, queries=queries, keys=keys, router_type=router_type)
-
-        return output, None
+        output, expert_output = self.experts(x, expert_weights, expert_indices, queries=queries, keys=keys, router_type=router_type)
 
         if router_type == "dense_approx":
           attention_scores = attention_scores.mean(dim=1).unsqueeze(1).expand(-1, self.experts.num_experts, -1, -1).clone()
@@ -426,3 +401,4 @@ class ParallelDroplessMoE(torch.nn.Module):
             # get all inputs that didn't go expert 0
             # get highest probs to expert 0, grouped by expert
             pass
+        return output, None
