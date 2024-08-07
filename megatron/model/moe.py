@@ -175,7 +175,7 @@ class ParallelDroplessMLP(torch.nn.Module):
         # e.g. indices 0, 1, 2, 3 will all correspond to input 0 if top_k = 4
         input_indices = indices // top_k
 
-        scattered_output = megablocks.ops.scatter(
+        expert_output = megablocks.ops.scatter(
             output,
             indices,
             bin_ids,
@@ -183,6 +183,8 @@ class ParallelDroplessMLP(torch.nn.Module):
             bins,
             top_k,
         )
+
+        approx_output = torch.zeros_like(expert_output)
 
         if router_type == "dense_approx_efficient":
             assert top_k == 1
@@ -204,12 +206,12 @@ class ParallelDroplessMLP(torch.nn.Module):
                 attn_result.masked_fill_(mask.unsqueeze(1), 0)
                 
                 # scatter the approximations the same way,
-                # but instead of top expert weight use the weight for expert 0 every time
-                scattered_output += megablocks.ops.scatter(
+                # but instead of top expert weight use the weight for expert i every time
+                approx_output = approx_output + megablocks.ops.scatter(
                     attn_result, 
                     indices, 
                     bin_ids, 
-                    torch.where(mask, 0, scores[:, 0]), 
+                    torch.where(mask, 0, scores[:, expert]), 
                     bins, 
                     top_k
                 )
@@ -278,7 +280,7 @@ class ParallelDroplessMLP(torch.nn.Module):
           pass
 
         # Un-route the data for the MoE output
-        return scattered_output
+        return expert_output + approx_output
 
     def forward(self, x, expert_weights, expert_indices, scores, queries=None, keys=None, router_type=None):
         """
