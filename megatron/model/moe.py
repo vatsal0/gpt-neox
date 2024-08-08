@@ -76,6 +76,7 @@ class ParallelDroplessMLP(torch.nn.Module):
             raise KeyError(neox_args.mlp_type)
 
         self.total_approx_count = 0
+        self.buffer = None
 
     def indices_and_bins(self, top_expert: torch.Tensor):
         # Sort the expert ids to produce the scatter/gather
@@ -170,18 +171,20 @@ class ParallelDroplessMLP(torch.nn.Module):
             output_parallel,
             tokens_per_expert,
         )
-        reshaped_output = torch.zeros((seq_len * batch_size * self.num_experts, output.size(-1))).to(output.device, dtype=output.dtype)
         # e.g. indices 0, 1, 2, 3 will all correspond to input 0 if top_k = 4
         input_indices = indices // top_k
+        if self.buffer is None:
+            self.buffer = torch.zeros((seq_len * batch_size * self.num_experts, output.size(-1))).to(output.device, dtype=output.dtype)
+        self.buffer.zero_()
 
         if router_type == "dense_approx_lsh":
-            reshaped_output = reshaped_output.view(
+            self.buffer = self.buffer.view(
                 seq_len * batch_size, 
                 self.num_experts, 
                 output.size(-1)
             )
 
-            nbits = 10
+            nbits = 11
             # the example here samples uniform [-0.5, 0.5] https://www.pinecone.io/learn/series/faiss/locality-sensitive-hashing-random-projection/
             lsh_vectors = torch.rand((input_.shape[-1], nbits), dtype=input_.dtype, device=input_.device) - 0.5
             hash_vectors = torch.matmul(input_.detach(), lsh_vectors) > 0
@@ -196,14 +199,7 @@ class ParallelDroplessMLP(torch.nn.Module):
             bucket_ends = megablocks.ops.inclusive_cumsum(bucket_counts, 0)
 
             scale = np.sqrt(input_.shape[-1])
-
-            bucket_starts = bucket_ends.roll(1) % bucket_ends[-1]
-
-            # from pdb import set_trace
-            # set_trace()
-
-            launch_lsh_approximation_kernel(input_, output, bin_ids, bucket_indices, bucket_starts, bucket_ends, reshaped_output, self.num_experts, 2**nbits)
-            
+            # print(bucket_counts.max(), flush=True)
             for i in range(2**nbits):
                 bucket_start = bucket_ends[i - 1] % bucket_ends[-1]
                 bucket_end = bucket_ends[i]
@@ -237,10 +233,10 @@ class ParallelDroplessMLP(torch.nn.Module):
                 approx[score_counts > 0] /= score_counts[score_counts > 0].unsqueeze(1)
                 self.total_approx_count += (score_counts > 0).sum()
 
-                reshaped_output[this_bucket_indices] = approx.transpose(0, 1)
+                self.buffer.scatter_(0, this_bucket_indices.view(-1, 1, 1), approx.transpose(0, 1))
         else:
           # ith element of output will be added to index corresponding to input index, and associated expert
-          reshaped_output.index_add_(dim=0, index=self.num_experts * input_indices + bin_ids, source=output)
+          self.buffer.index_add_(dim=0, index=self.num_experts * input_indices + bin_ids, source=output.detach())
 
         # Un-route the data for the MoE output
         return megablocks.ops.scatter(
@@ -250,7 +246,7 @@ class ParallelDroplessMLP(torch.nn.Module):
             expert_weights,
             bins,
             top_k,
-        ), reshaped_output.view(
+        ), self.buffer.view(
             seq_len * batch_size, 
             self.num_experts, 
             output.size(-1)
@@ -324,6 +320,7 @@ class ParallelDroplessMoE(torch.nn.Module):
         )
 
         self.attention = ScaledDotProduct().cuda()
+        self.routed_mask = None
 
     def forward(self, x, attention_scores, queries=None, keys=None, router_type_override=None):
         router_type = router_type_override
@@ -370,12 +367,13 @@ class ParallelDroplessMoE(torch.nn.Module):
             return output + approx_output, None
         
         if router_type == "dense_approx_efficient":
-            routed_mask = torch.zeros(expert_indices.size(0), self.experts.num_experts, dtype=torch.bool).to(expert_indices.device)
-            routed_mask.scatter_(1, expert_indices, 1)
-
-            # sl*bs x nexperts -> bs x nexperts x 1 x sl
-            att_mask = routed_mask.view(queries.shape[1], queries.shape[0], -1).transpose(0, 1).transpose(1, 2)
+            if self.routed_mask is None:
+                self.routed_mask = torch.zeros(expert_indices.size(0), self.experts.num_experts, dtype=torch.bool).to(expert_indices.device)
+            with torch.no_grad():
+                self.routed_mask.zero_().scatter_(1, expert_indices, 1)
             
+            att_mask = self.routed_mask.view(queries.shape[1], queries.shape[0], -1).transpose(0, 1).transpose(1, 2)
+
             attn_result = self.attention(
                 # bs x sl x nheads x head dim -> bs x nexperts x sl x head dim
                 queries.mean(dim=2, keepdim=True).expand(-1, -1, self.experts.num_experts, -1).transpose(1, 2),
