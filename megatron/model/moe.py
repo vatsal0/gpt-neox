@@ -28,7 +28,6 @@ print('done compiling')
 
 from xformers.components.attention import ScaledDotProduct
 
-
 class ParallelDroplessMLP(torch.nn.Module):
     """
     This class defines MoE expert computation, using tensor (model) parallel size as the expert parallel size
@@ -77,6 +76,8 @@ class ParallelDroplessMLP(torch.nn.Module):
 
         self.total_approx_count = 0
         self.buffer = None
+        self.scores = None
+        self.approx = None
 
     def indices_and_bins(self, top_expert: torch.Tensor):
         # Sort the expert ids to produce the scatter/gather
@@ -177,6 +178,13 @@ class ParallelDroplessMLP(torch.nn.Module):
             self.buffer = torch.zeros((seq_len * batch_size * self.num_experts, output.size(-1))).to(output.device, dtype=output.dtype)
         self.buffer.zero_()
 
+        if self.scores is None:
+            self.scores = torch.zeros(self.num_experts, seq_len * batch_size // 64, seq_len * batch_size // 64).to(input_.device, dtype=input_.dtype)
+        self.scores.zero_()
+        if self.approx is None:
+            self.approx = torch.zeros(self.num_experts, seq_len * batch_size // 64, output.size(-1)).to(output.device, dtype=output.dtype)
+        self.approx.zero_()
+
         if router_type == "dense_approx_lsh":
             self.buffer = self.buffer.view(
                 seq_len * batch_size, 
@@ -184,7 +192,7 @@ class ParallelDroplessMLP(torch.nn.Module):
                 output.size(-1)
             )
 
-            nbits = 11
+            nbits = 10
             # the example here samples uniform [-0.5, 0.5] https://www.pinecone.io/learn/series/faiss/locality-sensitive-hashing-random-projection/
             lsh_vectors = torch.rand((input_.shape[-1], nbits), dtype=input_.dtype, device=input_.device) - 0.5
             hash_vectors = torch.matmul(input_.detach(), lsh_vectors) > 0
@@ -199,41 +207,46 @@ class ParallelDroplessMLP(torch.nn.Module):
             bucket_ends = megablocks.ops.inclusive_cumsum(bucket_counts, 0)
 
             scale = np.sqrt(input_.shape[-1])
-            # print(bucket_counts.max(), flush=True)
+            # print((bucket_counts**2).sum(), flush=True)
             for i in range(2**nbits):
-                bucket_start = bucket_ends[i - 1] % bucket_ends[-1]
                 bucket_end = bucket_ends[i]
+                bucket_size = bucket_counts[i]
+                bucket_start = bucket_end - bucket_size
                 this_bucket_indices = bucket_indices[bucket_start : bucket_end]
+
+                if bucket_size > self.scores.shape[1]:
+                    this_bucket_indices = this_bucket_indices[torch.randperm(bucket_size)[:self.scores.shape[1]]]
+                    bucket_size = self.scores.shape[1]
 
                 this_bucket_input = input_[this_bucket_indices].detach()
                 this_bucket_expert_indices = bin_ids[this_bucket_indices]
+                this_bucket_output = output[this_bucket_indices].detach()
 
-                scores = torch.matmul(this_bucket_input / scale, this_bucket_input.T / scale)
-
+                torch.matmul(this_bucket_input / scale, this_bucket_input.T / scale, out=self.scores[0, :bucket_size, :bucket_size])
                 # zero out similarities between same vector, or any below threshold
                 threshold = 1 - 2 / self.num_experts
-                mask = torch.eye(scores.shape[0], dtype=torch.bool, device=scores.device).logical_or(scores < threshold)
-                scores.masked_fill_(mask, 0)
+                mask = torch.eye(bucket_size, dtype=torch.bool, device=self.scores.device).logical_or(self.scores[0, :bucket_size, :bucket_size] < threshold)
+                self.scores[0, :bucket_size, :bucket_size].masked_fill_(mask, 0)
 
-                scores = scores.repeat(self.num_experts, 1, 1)
+                self.scores[1:].copy_(self.scores[0])
                 # broadcasting to nxn matrices, of all 0, all 1, ... all num_experts-1. each entry represents the expert
-                expert_range = torch.arange(4, device=scores.device).view(-1, 1, 1)
+                expert_range = torch.arange(self.num_experts, device=self.scores.device).view(-1, 1, 1)
                 # for element i of this tensor, we want approximations for expert i, for tokens not routed to expert i, using similarities between tokens to expert i
                 # so if an entry's row matches the corresponding input's expert index (we don't want its value)
                 # or if an entry's column doesn't match the corresponding input's expert index (we don't want to use its score)
                 # set it to 0
                 # two masked fills with num_experts x n x 1 and num_experts x 1 x n avoids materializing an n^2 mask
-                scores.masked_fill_(expert_range.eq(this_bucket_expert_indices.unsqueeze(1)), 0)
-                scores.masked_fill_(expert_range.ne(this_bucket_expert_indices.unsqueeze(0)), 0)
+                self.scores[:, :bucket_size, :bucket_size].masked_fill_(expert_range.eq(this_bucket_expert_indices.unsqueeze(1)), 0)
+                self.scores[:, :bucket_size, :bucket_size].masked_fill_(expert_range.ne(this_bucket_expert_indices.unsqueeze(0)), 0)
 
                 # matmul (which does a weighted sum), then divide by counts (to make it a weighted average)
-                score_counts = (scores > 0).sum(dim=-1)
+                score_counts = (self.scores > 0).sum(dim=-1)
 
-                approx = torch.matmul(scores, output[this_bucket_indices].detach())
-                approx[score_counts > 0] /= score_counts[score_counts > 0].unsqueeze(1)
+                torch.matmul(self.scores[:, :bucket_size, :bucket_size], this_bucket_output, out=self.approx[:, :bucket_size])
+                self.approx[score_counts > 0] /= score_counts[score_counts > 0].unsqueeze(1)
                 self.total_approx_count += (score_counts > 0).sum()
 
-                self.buffer.scatter_(0, this_bucket_indices.view(-1, 1, 1), approx.transpose(0, 1))
+                self.buffer.index_add_(0, this_bucket_indices, self.approx[:, :bucket_size].transpose(0, 1))
         else:
           # ith element of output will be added to index corresponding to input index, and associated expert
           self.buffer.index_add_(dim=0, index=self.num_experts * input_indices + bin_ids, source=output.detach())
