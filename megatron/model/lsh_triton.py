@@ -2,8 +2,11 @@ import triton
 import triton.language as tl
 
 from pdb import set_trace
-# import os
+import os
 # os.environ["TRITON_INTERPRET"] = '1'
+
+os.environ["TORCH_LOGS"] = "+dynamo"
+os.environ["TORCHDYNAMO_VERBOSE"] = "1"
 
 @triton.jit
 def lsh_approximation_kernel(
@@ -59,12 +62,13 @@ def lsh_approximation_kernel(
     # Compute approximation
     approx = tl.dot(expert_scores, output_block.to(tl.float32))
     score_counts = tl.sum(expert_scores > 0, axis=1)
-    approx = tl.where(score_counts > 0, approx / score_counts[:, None], approx)
+    approx = tl.where(score_counts[:, None] > 0, approx / score_counts[:, None], approx)
     
     # Store approximation
     store_locs = this_bucket_indices[:, None] * num_experts * output_dim + expert * output_dim + output_dims[None, :]
     store_mask = bucket_mask[:, None] & (output_dims < output_dim)[None, :]
-    tl.store(reshaped_output + store_locs, approx, mask=store_mask)
+    tl.atomic_add(reshaped_output + store_locs, approx)
+    # tl.store(reshaped_output + store_locs, approx, mask=store_mask)
 
 # Launch the kernel
 def launch_lsh_approximation_kernel(input_, output, bin_ids, bucket_indices, bucket_starts, bucket_ends, reshaped_output, num_experts, num_buckets):

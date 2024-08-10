@@ -205,9 +205,13 @@ class ParallelDroplessMLP(torch.nn.Module):
             bucket_ids, bucket_indices = megablocks.ops.sort(hashes, nbits)
             bucket_counts = megablocks.ops.histogram(hashes, 2**nbits)
             bucket_ends = megablocks.ops.inclusive_cumsum(bucket_counts, 0)
+            bucket_starts = bucket_ends.roll(1) % bucket_ends[-1]
 
             scale = np.sqrt(input_.shape[-1])
             # print((bucket_counts**2).sum(), flush=True)
+            # print('before', self.buffer.sum(), flush=True)
+            kernel(input_, output, bin_ids, bucket_indices, bucket_starts, bucket_ends, self.buffer, self.num_experts, 2**nbits)
+            # print('after', self.buffer.sum(), flush=True)
             for i in range(2**nbits):
                 bucket_end = bucket_ends[i]
                 bucket_size = bucket_counts[i]
