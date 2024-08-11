@@ -112,6 +112,7 @@ class ParallelDroplessMLP(torch.nn.Module):
         bins: torch.Tensor,
         top_k: int,
         router_type: str,
+        buffer: torch.Tensor,
         queries=None,
         keys=None
     ):
@@ -174,19 +175,9 @@ class ParallelDroplessMLP(torch.nn.Module):
         )
         # e.g. indices 0, 1, 2, 3 will all correspond to input 0 if top_k = 4
         input_indices = indices // top_k
-        if self.buffer is None:
-            self.buffer = torch.zeros((seq_len * batch_size * self.num_experts, output.size(-1))).to(output.device, dtype=output.dtype)
-        self.buffer.zero_()
-
-        if self.scores is None:
-            self.scores = torch.zeros(self.num_experts, seq_len * batch_size // 64, seq_len * batch_size // 64).to(input_.device, dtype=input_.dtype)
-        self.scores.zero_()
-        if self.approx is None:
-            self.approx = torch.zeros(self.num_experts, seq_len * batch_size // 64, output.size(-1)).to(output.device, dtype=output.dtype)
-        self.approx.zero_()
 
         if router_type == "dense_approx_lsh":
-            self.buffer = self.buffer.view(
+            buffer = buffer.view(
                 seq_len * batch_size, 
                 self.num_experts, 
                 output.size(-1)
@@ -210,7 +201,7 @@ class ParallelDroplessMLP(torch.nn.Module):
             scale = np.sqrt(input_.shape[-1])
             # print((bucket_counts**2).sum(), flush=True)
             # print('before', self.buffer.sum(), flush=True)
-            kernel(input_, output, bin_ids, bucket_indices, bucket_starts, bucket_ends, self.buffer, self.num_experts, 2**nbits)
+            kernel(input_, output, bin_ids, bucket_indices, bucket_starts, bucket_ends, buffer, self.num_experts, 2**nbits)
             # print('after', self.buffer.sum(), flush=True)
             for i in range(2**nbits):
                 bucket_end = bucket_ends[i]
@@ -250,10 +241,10 @@ class ParallelDroplessMLP(torch.nn.Module):
                 self.approx[score_counts > 0] /= score_counts[score_counts > 0].unsqueeze(1)
                 self.total_approx_count += (score_counts > 0).sum()
 
-                self.buffer.index_add_(0, this_bucket_indices, self.approx[:, :bucket_size].transpose(0, 1))
+                buffer.index_add_(0, this_bucket_indices, self.approx[:, :bucket_size].transpose(0, 1))
         else:
           # ith element of output will be added to index corresponding to input index, and associated expert
-          self.buffer.index_add_(dim=0, index=self.num_experts * input_indices + bin_ids, source=output.detach())
+          buffer.index_add_(dim=0, index=self.num_experts * input_indices + bin_ids, source=output.detach())
 
         # Un-route the data for the MoE output
         return megablocks.ops.scatter(
@@ -263,13 +254,9 @@ class ParallelDroplessMLP(torch.nn.Module):
             expert_weights,
             bins,
             top_k,
-        ), self.buffer.view(
-            seq_len * batch_size, 
-            self.num_experts, 
-            output.size(-1)
         )
 
-    def forward(self, x, expert_weights, expert_indices, queries=None, keys=None, router_type=None):
+    def forward(self, x, expert_weights, expert_indices, scores, router_type=None):
         """
         grouped_forward_once
 
@@ -280,31 +267,72 @@ class ParallelDroplessMLP(torch.nn.Module):
         # save shape so we can re-shape the outputs later
         in_shape = x.size()
 
-        # both are now (sl * bs * top_k)
-        expert_weights = expert_weights.flatten()
-        expert_indices = expert_indices.flatten()
+        seq_len, batch_size = x.shape[0], x.shape[1]
+
+        # initialize buffers here since we are calling permute_and_compute multiple times
+        if self.buffer is None:
+            self.buffer = torch.zeros((seq_len * batch_size * self.num_experts, x.size(-1))).to(x.device, dtype=x.dtype)
+        self.buffer.zero_()
+
+        if self.scores is None:
+            self.scores = torch.zeros(self.num_experts, seq_len * batch_size // 64, seq_len * batch_size // 64).to(x.device, dtype=x.dtype)
+        self.scores.zero_()
+        if self.approx is None:
+            self.approx = torch.zeros(self.num_experts, seq_len * batch_size // 64, x.size(-1)).to(x.device, dtype=x.dtype)
+        self.approx.zero_()
+
+        trim_idx = max(seq_len // self.num_experts, 1)
+
+        # these return a view of the original tensor without allocating new memory
+        dense_x, sparse_x = x.split([trim_idx, seq_len - trim_idx], dim=0)
+        dense_buffer, sparse_buffer = self.buffer.view(seq_len, batch_size, self.num_experts, -1).split([trim_idx, seq_len - trim_idx], dim=0)
+
+        dense_expert_weights = scores.view(seq_len, batch_size, -1)[:trim_idx, :, :].flatten()
+        sparse_expert_weights = expert_weights.view(seq_len, batch_size, -1)[trim_idx:, :, :].flatten()
+
+        dense_expert_indices = torch.arange(self.num_experts, dtype=expert_indices.dtype).repeat(trim_idx, batch_size, 1).to(expert_indices.device).flatten()
+        sparse_expert_indices = expert_indices.view(seq_len, batch_size, -1)[trim_idx:, :, :].flatten()
 
         with torch.no_grad():
-            indices, bin_ids, bins, tokens_per_expert = self.indices_and_bins(
-                expert_indices
+            dense_indices, dense_bin_ids, dense_bins, dense_tokens_per_expert = self.indices_and_bins(
+                dense_expert_indices
+            )
+            sparse_indices, sparse_bin_ids, sparse_bins, sparse_tokens_per_expert = self.indices_and_bins(
+                sparse_expert_indices
             )
 
-        x, expert_output = self.permute_and_compute(
-            x,
-            tokens_per_expert,
-            indices,
-            bin_ids,
-            expert_weights,
-            bins,
-            self.top_k if router_type != "dense" else self.num_experts,
+        dense_x = self.permute_and_compute(
+            dense_x,
+            dense_tokens_per_expert,
+            dense_indices,
+            dense_bin_ids,
+            dense_expert_weights,
+            dense_bins,
+            self.num_experts,
             router_type,
-            queries=queries,
-            keys=keys
+            dense_buffer.view(-1, x.size(-1))
+        )
+
+        sparse_x = self.permute_and_compute(
+            sparse_x,
+            sparse_tokens_per_expert,
+            sparse_indices,
+            sparse_bin_ids,
+            sparse_expert_weights,
+            sparse_bins,
+            self.top_k,
+            router_type,
+            sparse_buffer.view(-1, x.size(-1))
         )
 
         # restore input shape
-        x = x.view(in_shape)
-        return x, expert_output
+        x = torch.cat((dense_x.view(trim_idx, batch_size, -1), sparse_x.view(seq_len - trim_idx, batch_size, -1)), dim=0)
+        
+        return x, trim_idx, self.buffer.view(
+            seq_len * batch_size, 
+            self.num_experts, 
+            x.size(-1)
+        )
 
 
 def cast_if_autocast_enabled(tensor: torch.Tensor):
@@ -356,7 +384,7 @@ class ParallelDroplessMoE(torch.nn.Module):
         expert_weights, expert_indices, scores = self.router(x, router_type_override=router_type_override)
 
         # return value should be
-        output, expert_output = self.experts(x, expert_weights, expert_indices, queries=queries, keys=keys, router_type=router_type)
+        output, trim_idx, expert_output = self.experts(x, expert_weights, expert_indices, scores, router_type=router_type)
 
         if router_type == "dense_approx":
           attention_scores = attention_scores.mean(dim=1).unsqueeze(1).expand(-1, self.experts.num_experts, -1, -1).clone()
@@ -388,6 +416,8 @@ class ParallelDroplessMoE(torch.nn.Module):
                 self.routed_mask = torch.zeros(expert_indices.size(0), self.experts.num_experts, dtype=torch.bool).to(expert_indices.device)
             with torch.no_grad():
                 self.routed_mask.zero_().scatter_(1, expert_indices, 1)
+                dense_expert_indices = torch.arange(self.experts.num_experts, dtype=expert_indices.dtype).repeat(trim_idx, x.shape[1], 1).to(expert_indices.device).view(-1, self.experts.num_experts)
+                self.routed_mask.scatter_(1, dense_expert_indices, 1)
             
             att_mask = self.routed_mask.view(queries.shape[1], queries.shape[0], -1).transpose(0, 1).transpose(1, 2)
 
