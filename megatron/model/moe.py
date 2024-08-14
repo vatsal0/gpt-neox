@@ -28,6 +28,9 @@ print('done compiling')
 
 from xformers.components.attention import ScaledDotProduct
 
+from torch.nn.attention.flex_attention import flex_attention
+from torch.nn.attention.flex_attention import create_block_mask
+
 class ParallelDroplessMLP(torch.nn.Module):
     """
     This class defines MoE expert computation, using tensor (model) parallel size as the expert parallel size
@@ -412,30 +415,47 @@ class ParallelDroplessMoE(torch.nn.Module):
             return output + approx_output, None
         
         if router_type == "dense_approx_efficient":
-            if self.routed_mask is None:
-                self.routed_mask = torch.zeros(expert_indices.size(0), self.experts.num_experts, dtype=torch.bool).to(expert_indices.device)
-            with torch.no_grad():
-                self.routed_mask.zero_().scatter_(1, expert_indices, 1)
-                dense_expert_indices = torch.arange(self.experts.num_experts, dtype=expert_indices.dtype).repeat(trim_idx, x.shape[1], 1).to(expert_indices.device).view(-1, self.experts.num_experts)
-                self.routed_mask.scatter_(1, dense_expert_indices, 1)
-            
-            att_mask = self.routed_mask.view(queries.shape[1], queries.shape[0], -1).transpose(0, 1).transpose(1, 2)
+            bsz = queries.shape[0]
+            def orig_mask_fn(b, h, q_idx, kv_idx):
+                # row token has attn to col token if row isn't from expert and either col is, or col is dense token in seq
+                # or no attn at all if row was part of dense tokens
+                return (
+                    expert_indices[q_idx * bsz + b].ne(h).all(dim=-1) 
+                    & (expert_indices[kv_idx * bsz + b].eq(h).any(dim=-1) | (kv_idx < trim_idx)) 
+                    & (q_idx >= trim_idx)
+                )
 
-            attn_result = self.attention(
-                # bs x sl x nheads x head dim -> bs x nexperts x sl x head dim
+            def mask_fn(b, h, q_idx, kv_idx):
+                # expert indices is sl x bs x nexperts
+                # row token wasn't routed to expert
+                # and (col token was routed to expert or (col token is dense token and col token was routed to row token's expert))
+                # and row token isn't a dense token
+                return (
+                    expert_indices[q_idx * bsz + b].ne(h).all(dim=-1) 
+                    & (expert_indices[kv_idx * bsz + b].eq(h).any(dim=-1) 
+                       | ((kv_idx < trim_idx) 
+                           & (expert_indices[q_idx * bsz + b] == expert_indices[kv_idx * bsz + b]).any(dim=-1))
+                      )
+                    & (q_idx >= trim_idx))
+
+            block_mask = create_block_mask(mask_fn, B=bsz, H=self.experts.num_experts, Q_LEN=queries.shape[1], KV_LEN=queries.shape[1])
+
+            min_val = torch.finfo(expert_output.dtype).min
+            threshold_val = 0
+            def threshold_fn(score, b, h, q_idx, kv_idx):
+                return score + (score > threshold_val) * min_val
+            
+            attn_result = flex_attention(
+                # bs x sl x nheads x head dim -> bs x nexperts x sl x head dim 
                 queries.mean(dim=2, keepdim=True).expand(-1, -1, self.experts.num_experts, -1).transpose(1, 2),
                 # bs x sl x nheads x head dim -> bs x nexperts x sl x head dim
                 keys.mean(dim=2, keepdim=True).expand(-1, -1, self.experts.num_experts, -1).transpose(1, 2), 
                 # sl*bs x nexperts x hidden dim -> bs x nexperts x sl x hidden dim
                 expert_output.view(queries.shape[1], queries.shape[0], self.experts.num_experts, -1).transpose(0, 1).transpose(1, 2),
-                # select columns of routed tokens
-                att_mask=att_mask.unsqueeze(2)
+                block_mask=block_mask,
+                # score_mod=threshold_fn
             )
-            # -> bs x nexperts x sl x hidden dim
-            # remove value rows of routed tokens
-            # rarely a whole sequence can be masked out (all tokens routed to that expert) resulting in nans
-            # in either case mask out approximations
-            attn_result = torch.where(torch.logical_or(att_mask.unsqueeze(3), torch.isnan(attn_result)), 0, attn_result)
+            attn_result = torch.where(torch.isnan(attn_result), 0, attn_result)
 
             approx_output = (scores.view(*x.shape[:2], -1).unsqueeze(-1) * attn_result.transpose(1, 2).transpose(0, 1)).sum(dim=2)
 
