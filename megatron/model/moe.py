@@ -179,75 +179,8 @@ class ParallelDroplessMLP(torch.nn.Module):
         # e.g. indices 0, 1, 2, 3 will all correspond to input 0 if top_k = 4
         input_indices = indices // top_k
 
-        if router_type == "dense_approx_lsh":
-            buffer = buffer.view(
-                seq_len * batch_size, 
-                self.num_experts, 
-                output.size(-1)
-            )
-
-            nbits = 10
-            # the example here samples uniform [-0.5, 0.5] https://www.pinecone.io/learn/series/faiss/locality-sensitive-hashing-random-projection/
-            lsh_vectors = torch.rand((input_.shape[-1], nbits), dtype=input_.dtype, device=input_.device) - 0.5
-            hash_vectors = torch.matmul(input_.detach(), lsh_vectors) > 0
-
-            # since nbits is small, let's use tensor operations to turn each unique binary vector into an integer representation
-            exponents = 2 ** torch.arange(nbits - 1, -1, -1).to(hash_vectors.device)
-            hashes = torch.sum(exponents * hash_vectors, -1)
-
-            # get buckets for all vectors
-            bucket_ids, bucket_indices = megablocks.ops.sort(hashes, nbits)
-            bucket_counts = megablocks.ops.histogram(hashes, 2**nbits)
-            bucket_ends = megablocks.ops.inclusive_cumsum(bucket_counts, 0)
-            bucket_starts = bucket_ends.roll(1) % bucket_ends[-1]
-
-            scale = np.sqrt(input_.shape[-1])
-            # print((bucket_counts**2).sum(), flush=True)
-            # print('before', self.buffer.sum(), flush=True)
-            kernel(input_, output, bin_ids, bucket_indices, bucket_starts, bucket_ends, buffer, self.num_experts, 2**nbits)
-            # print('after', self.buffer.sum(), flush=True)
-            for i in range(2**nbits):
-                bucket_end = bucket_ends[i]
-                bucket_size = bucket_counts[i]
-                bucket_start = bucket_end - bucket_size
-                this_bucket_indices = bucket_indices[bucket_start : bucket_end]
-
-                if bucket_size > self.scores.shape[1]:
-                    this_bucket_indices = this_bucket_indices[torch.randperm(bucket_size)[:self.scores.shape[1]]]
-                    bucket_size = self.scores.shape[1]
-
-                this_bucket_input = input_[this_bucket_indices].detach()
-                this_bucket_expert_indices = bin_ids[this_bucket_indices]
-                this_bucket_output = output[this_bucket_indices].detach()
-
-                torch.matmul(this_bucket_input / scale, this_bucket_input.T / scale, out=self.scores[0, :bucket_size, :bucket_size])
-                # zero out similarities between same vector, or any below threshold
-                threshold = 1 - 2 / self.num_experts
-                mask = torch.eye(bucket_size, dtype=torch.bool, device=self.scores.device).logical_or(self.scores[0, :bucket_size, :bucket_size] < threshold)
-                self.scores[0, :bucket_size, :bucket_size].masked_fill_(mask, 0)
-
-                self.scores[1:].copy_(self.scores[0])
-                # broadcasting to nxn matrices, of all 0, all 1, ... all num_experts-1. each entry represents the expert
-                expert_range = torch.arange(self.num_experts, device=self.scores.device).view(-1, 1, 1)
-                # for element i of this tensor, we want approximations for expert i, for tokens not routed to expert i, using similarities between tokens to expert i
-                # so if an entry's row matches the corresponding input's expert index (we don't want its value)
-                # or if an entry's column doesn't match the corresponding input's expert index (we don't want to use its score)
-                # set it to 0
-                # two masked fills with num_experts x n x 1 and num_experts x 1 x n avoids materializing an n^2 mask
-                self.scores[:, :bucket_size, :bucket_size].masked_fill_(expert_range.eq(this_bucket_expert_indices.unsqueeze(1)), 0)
-                self.scores[:, :bucket_size, :bucket_size].masked_fill_(expert_range.ne(this_bucket_expert_indices.unsqueeze(0)), 0)
-
-                # matmul (which does a weighted sum), then divide by counts (to make it a weighted average)
-                score_counts = (self.scores > 0).sum(dim=-1)
-
-                torch.matmul(self.scores[:, :bucket_size, :bucket_size], this_bucket_output, out=self.approx[:, :bucket_size])
-                self.approx[score_counts > 0] /= score_counts[score_counts > 0].unsqueeze(1)
-                self.total_approx_count += (score_counts > 0).sum()
-
-                buffer.index_add_(0, this_bucket_indices, self.approx[:, :bucket_size].transpose(0, 1))
-        else:
-          # ith element of output will be added to index corresponding to input index, and associated expert
-          buffer.index_add_(dim=0, index=self.num_experts * input_indices + bin_ids, source=output.detach())
+        # ith element of output will be added to index corresponding to input index, and associated expert
+        buffer.index_add_(dim=0, index=self.num_experts * input_indices + bin_ids, source=output.detach())
 
         # Un-route the data for the MoE output
         return megablocks.ops.scatter(
@@ -411,8 +344,67 @@ class ParallelDroplessMoE(torch.nn.Module):
           return output + approx_output, None
 
         if router_type == "dense_approx_lsh":
-            approx_output = (scores.unsqueeze(-1) * expert_output).sum(dim=1).view(x.shape)
+            nbits = 10
+            # the example here samples uniform [-0.5, 0.5] https://www.pinecone.io/learn/series/faiss/locality-sensitive-hashing-random-projection/
+            lsh_vectors = torch.rand((x.shape[-1], nbits), dtype=x.dtype, device=x.device) - 0.5
+            hash_vectors = torch.matmul(x.detach(), lsh_vectors) > 0
+
+            # since nbits is small, let's use tensor operations to turn each unique binary vector into an integer representation
+            exponents = 2 ** torch.arange(nbits - 1, -1, -1).to(hash_vectors.device)
+            hashes = torch.sum(exponents * hash_vectors, -1).view(-1)
+            
+            bucket_ids, bucket_indices = megablocks.ops.sort(hashes, nbits)
+            scale = np.sqrt(x.shape[-1])
+
+            min_val = torch.finfo(expert_output.dtype).min
+            threshold_val = 1 - 2/self.experts.num_experts
+            def threshold_fn(score, b, h, q_idx, kv_idx):
+                return score + (score > threshold_val) * min_val
+
+            '''Unsorted masking
+            input_queries = x.view(-1, x.shape[-1]).unsqueeze(1).expand(-1, self.experts.num_experts, -1)
+            input_keys = x.view(-1, x.shape[-1]).unsqueeze(1).expand(-1, self.experts.num_experts, -1)
+
+            def mask_fn(b, h, q_idx, kv_idx):
+                return (
+                        (hashes[q_idx] == hashes[kv_idx])
+                        & expert_indices[q_idx].ne(h).all(dim=-1) 
+                        & (expert_indices[kv_idx].eq(h).any(dim=-1) | (kv_idx < trim_idx)) 
+                        & (q_idx >= trim_idx)
+                    )
+            # sparsity: ~4%
+            block_mask = create_block_mask(mask_fn, B=1, H=self.experts.num_experts, Q_LEN=input_queries.shape[0], KV_LEN=input_keys.shape[0])
+
+            attn_result = flex_attention(input_queries.transpose(0, 1).unsqueeze(0)/scale, input_keys.transpose(0, 1).unsqueeze(0)/scale, expert_output.transpose(0, 1).unsqueeze(0), block_mask=block_mask, score_mod=threshold_fn)
+            attn_result = torch.where(torch.isnan(attn_result), 0, attn_result)
+
+            approx_output = (scores.unsqueeze(-1) * attn_result.squeeze(0).transpose(0, 1)).sum(dim=1).view(output.shape)
+
             return output + approx_output, None
+            '''
+            
+            #'''Sorted masking
+            input_queries = x.view(-1, x.shape[-1])[bucket_indices].unsqueeze(1).expand(-1, self.experts.num_experts, -1)
+            input_keys = x.view(-1, x.shape[-1])[bucket_indices].unsqueeze(1).expand(-1, self.experts.num_experts, -1)
+            bucket_expert_indices = expert_indices[bucket_indices]
+
+            def mask_fn(b, h, q_idx, kv_idx):
+                return (
+                        (bucket_ids[q_idx] == bucket_ids[kv_idx])
+                        & bucket_expert_indices[q_idx].ne(h).all(dim=-1) 
+                        & (bucket_expert_indices[kv_idx].eq(h).any(dim=-1) | (bucket_indices[kv_idx] < trim_idx)) 
+                        & (bucket_indices[q_idx] >= trim_idx)
+                )
+
+            # sparsity: ~98%
+            block_mask = create_block_mask(mask_fn, B=1, H=self.experts.num_experts, Q_LEN=input_queries.shape[0], KV_LEN=input_keys.shape[0])
+
+            attn_result = flex_attention(input_queries.transpose(0, 1).unsqueeze(0)/scale, input_keys.transpose(0, 1).unsqueeze(0)/scale, expert_output[bucket_indices].transpose(0, 1).unsqueeze(0), block_mask=block_mask, score_mod=threshold_fn)
+            attn_result = torch.where(torch.isnan(attn_result), 0, attn_result)
+
+            approx_output = (scores[bucket_indices].unsqueeze(-1) * attn_result.squeeze(0).transpose(0, 1)).sum(dim=1)
+
+            return output.view(approx_output.shape).index_add_(dim=0, index=bucket_indices, source=approx_output).view(x.shape), None
         
         if router_type == "dense_approx_efficient":
             bsz = queries.shape[0]
