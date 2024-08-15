@@ -360,6 +360,9 @@ class ParallelDroplessMoE(torch.nn.Module):
             threshold_val = 1 - 2/self.experts.num_experts
             def threshold_fn(score, b, h, q_idx, kv_idx):
                 return score + (score > threshold_val) * min_val
+            
+            expert_routed_mask = torch.zeros(expert_indices.shape[0], self.experts.num_experts, dtype=torch.bool).to(expert_indices.device)
+            expert_routed_mask.scatter_(1, expert_indices, 1)
 
             '''Unsorted masking
             input_queries = x.view(-1, x.shape[-1]).unsqueeze(1).expand(-1, self.experts.num_experts, -1)
@@ -387,12 +390,13 @@ class ParallelDroplessMoE(torch.nn.Module):
             input_queries = x.view(-1, x.shape[-1])[bucket_indices].unsqueeze(1).expand(-1, self.experts.num_experts, -1)
             input_keys = x.view(-1, x.shape[-1])[bucket_indices].unsqueeze(1).expand(-1, self.experts.num_experts, -1)
             bucket_expert_indices = expert_indices[bucket_indices]
+            bucket_expert_mask = expert_routed_mask[bucket_indices]
 
             def mask_fn(b, h, q_idx, kv_idx):
                 return (
                         (bucket_ids[q_idx] == bucket_ids[kv_idx])
-                        & bucket_expert_indices[q_idx].ne(h).all(dim=-1) 
-                        & (bucket_expert_indices[kv_idx].eq(h).any(dim=-1) | (bucket_indices[kv_idx] < trim_idx)) 
+                        & ~bucket_expert_mask[q_idx, h]
+                        & (bucket_expert_mask[kv_idx, h] | (bucket_indices[kv_idx] < trim_idx)) 
                         & (bucket_indices[q_idx] >= trim_idx)
                 )
 
