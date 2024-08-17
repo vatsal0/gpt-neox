@@ -364,35 +364,22 @@ class ParallelDroplessMoE(torch.nn.Module):
             expert_routed_mask = torch.zeros(expert_indices.shape[0], self.experts.num_experts, dtype=torch.bool).to(expert_indices.device)
             expert_routed_mask.scatter_(1, expert_indices, 1)
 
-            '''Unsorted masking
-            input_queries = x.view(-1, x.shape[-1]).unsqueeze(1).expand(-1, self.experts.num_experts, -1)
-            input_keys = x.view(-1, x.shape[-1]).unsqueeze(1).expand(-1, self.experts.num_experts, -1)
-
-            def mask_fn(b, h, q_idx, kv_idx):
-                return (
-                        (hashes[q_idx] == hashes[kv_idx])
-                        & expert_indices[q_idx].ne(h).all(dim=-1) 
-                        & (expert_indices[kv_idx].eq(h).any(dim=-1) | (kv_idx < trim_idx)) 
-                        & (q_idx >= trim_idx)
-                    )
-            # sparsity: ~4%
-            block_mask = create_block_mask(mask_fn, B=1, H=self.experts.num_experts, Q_LEN=input_queries.shape[0], KV_LEN=input_keys.shape[0])
-
-            attn_result = flex_attention(input_queries.transpose(0, 1).unsqueeze(0)/scale, input_keys.transpose(0, 1).unsqueeze(0)/scale, expert_output.transpose(0, 1).unsqueeze(0), block_mask=block_mask, score_mod=threshold_fn)
-            attn_result = torch.where(torch.isnan(attn_result), 0, attn_result)
-
-            approx_output = (scores.unsqueeze(-1) * attn_result.squeeze(0).transpose(0, 1)).sum(dim=1).view(output.shape)
-
-            return output + approx_output, None
-            '''
-            
-            #'''Sorted masking
             input_queries = x.view(-1, x.shape[-1])[bucket_indices].unsqueeze(1).expand(-1, self.experts.num_experts, -1)
             input_keys = x.view(-1, x.shape[-1])[bucket_indices].unsqueeze(1).expand(-1, self.experts.num_experts, -1)
+            # input_queries = queries.mean(dim=2, keepdim=True).expand(-1, -1, self.experts.num_experts, -1).transpose(0, 1).reshape(expert_indices.shape[0], self.experts.num_experts, -1)[bucket_indices]
+            # input_keys = keys.mean(dim=2, keepdim=True).expand(-1, -1, self.experts.num_experts, -1).transpose(0, 1).reshape(expert_indices.shape[0], self.experts.num_experts, -1)[bucket_indices]
+            n_chunks = 4
+            chunk_size = input_queries.shape[0] // n_chunks
+            chunk_queries = input_queries.view(n_chunks, chunk_size, self.experts.num_experts, -1).transpose(1, 2)
+            chunk_keys = input_keys.view(n_chunks, chunk_size, self.experts.num_experts, -1).transpose(1, 2)
+            chunk_values = expert_output[bucket_indices].view(n_chunks, chunk_size, self.experts.num_experts, -1).transpose(1, 2)
+
             bucket_expert_indices = expert_indices[bucket_indices]
             bucket_expert_mask = expert_routed_mask[bucket_indices]
 
             def mask_fn(b, h, q_idx, kv_idx):
+                q_idx = b * chunk_size + q_idx
+                kv_idx = b * chunk_size + kv_idx
                 return (
                         (bucket_ids[q_idx] == bucket_ids[kv_idx])
                         & ~bucket_expert_mask[q_idx, h]
@@ -401,12 +388,13 @@ class ParallelDroplessMoE(torch.nn.Module):
                 )
 
             # sparsity: ~98%
-            block_mask = create_block_mask(mask_fn, B=1, H=self.experts.num_experts, Q_LEN=input_queries.shape[0], KV_LEN=input_keys.shape[0])
+            block_mask = create_block_mask(mask_fn, B=n_chunks, H=self.experts.num_experts, Q_LEN=chunk_size, KV_LEN=chunk_size)
 
-            attn_result = flex_attention(input_queries.transpose(0, 1).unsqueeze(0)/scale, input_keys.transpose(0, 1).unsqueeze(0)/scale, expert_output[bucket_indices].transpose(0, 1).unsqueeze(0), block_mask=block_mask, score_mod=threshold_fn)
+            attn_result = flex_attention(chunk_queries/scale, chunk_keys/scale, chunk_values, block_mask=block_mask, score_mod=threshold_fn)
+            attn_result = attn_result.transpose(1, 2).flatten(0, 1)
             attn_result = torch.where(torch.isnan(attn_result), 0, attn_result)
 
-            approx_output = (scores[bucket_indices].unsqueeze(-1) * attn_result.squeeze(0).transpose(0, 1)).sum(dim=1)
+            approx_output = (scores[bucket_indices].unsqueeze(-1) * attn_result).sum(dim=1)
 
             return output.view(approx_output.shape).index_add_(dim=0, index=bucket_indices, source=approx_output).view(x.shape), None
         
