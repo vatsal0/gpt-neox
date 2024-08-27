@@ -79,8 +79,6 @@ class ParallelDroplessMLP(torch.nn.Module):
 
         self.total_approx_count = 0
         self.buffer = None
-        self.scores = None
-        self.approx = None
 
     def indices_and_bins(self, top_expert: torch.Tensor):
         # Sort the expert ids to produce the scatter/gather
@@ -114,10 +112,7 @@ class ParallelDroplessMLP(torch.nn.Module):
         expert_weights: torch.Tensor,
         bins: torch.Tensor,
         top_k: int,
-        router_type: str,
         buffer: torch.Tensor,
-        queries=None,
-        keys=None
     ):
         """
         grouped_permute_and_compute
@@ -192,7 +187,7 @@ class ParallelDroplessMLP(torch.nn.Module):
             top_k,
         )
 
-    def forward(self, x, expert_weights, expert_indices, scores, router_type=None):
+    def forward(self, x, expert_weights, expert_indices, router_type=None):
         """
         grouped_forward_once
 
@@ -210,61 +205,28 @@ class ParallelDroplessMLP(torch.nn.Module):
             self.buffer = torch.zeros((seq_len * batch_size * self.num_experts, x.size(-1))).to(x.device, dtype=x.dtype)
         self.buffer.zero_()
 
-        if self.scores is None:
-            self.scores = torch.zeros(self.num_experts, seq_len * batch_size // 64, seq_len * batch_size // 64).to(x.device, dtype=x.dtype)
-        self.scores.zero_()
-        if self.approx is None:
-            self.approx = torch.zeros(self.num_experts, seq_len * batch_size // 64, x.size(-1)).to(x.device, dtype=x.dtype)
-        self.approx.zero_()
-
-        trim_idx = max(seq_len // self.num_experts, 1)
-
-        # these return a view of the original tensor without allocating new memory
-        dense_x, sparse_x = x.split([trim_idx, seq_len - trim_idx], dim=0)
-        dense_buffer, sparse_buffer = self.buffer.view(seq_len, batch_size, self.num_experts, -1).split([trim_idx, seq_len - trim_idx], dim=0)
-
-        dense_expert_weights = scores.view(seq_len, batch_size, -1)[:trim_idx, :, :].flatten()
-        sparse_expert_weights = expert_weights.view(seq_len, batch_size, -1)[trim_idx:, :, :].flatten()
-
-        dense_expert_indices = torch.arange(self.num_experts, dtype=expert_indices.dtype).repeat(trim_idx, batch_size, 1).to(expert_indices.device).flatten()
-        sparse_expert_indices = expert_indices.view(seq_len, batch_size, -1)[trim_idx:, :, :].flatten()
+        expert_weights = expert_weights.flatten()
+        expert_indices = expert_indices.flatten()
 
         with torch.no_grad():
-            dense_indices, dense_bin_ids, dense_bins, dense_tokens_per_expert = self.indices_and_bins(
-                dense_expert_indices
-            )
-            sparse_indices, sparse_bin_ids, sparse_bins, sparse_tokens_per_expert = self.indices_and_bins(
-                sparse_expert_indices
+            indices, bin_ids, bins, tokens_per_expert = self.indices_and_bins(
+                expert_indices
             )
 
-        dense_x = self.permute_and_compute(
-            dense_x,
-            dense_tokens_per_expert,
-            dense_indices,
-            dense_bin_ids,
-            dense_expert_weights,
-            dense_bins,
-            self.num_experts,
-            router_type,
-            dense_buffer.view(-1, x.size(-1))
+        x = self.permute_and_compute(
+            x,
+            tokens_per_expert,
+            indices,
+            bin_ids,
+            expert_weights,
+            bins,
+            self.top_k if router_type != "dense" else self.num_experts,
+            self.buffer.view(-1, x.size(-1))
         )
 
-        sparse_x = self.permute_and_compute(
-            sparse_x,
-            sparse_tokens_per_expert,
-            sparse_indices,
-            sparse_bin_ids,
-            sparse_expert_weights,
-            sparse_bins,
-            self.top_k,
-            router_type,
-            sparse_buffer.view(-1, x.size(-1))
-        )
+        x = x.view(in_shape)
 
-        # restore input shape
-        x = torch.cat((dense_x.view(trim_idx, batch_size, -1), sparse_x.view(seq_len - trim_idx, batch_size, -1)), dim=0)
-        
-        return x, trim_idx, self.buffer.view(
+        return x, self.buffer.view(
             seq_len * batch_size, 
             self.num_experts, 
             x.size(-1)
@@ -301,7 +263,6 @@ class ParallelDroplessMoE(torch.nn.Module):
         )
 
         self.attention = ScaledDotProduct().cuda()
-        self.routed_mask = None
 
     def forward(self, x, attention_scores, queries=None, keys=None, router_type_override=None):
         router_type = router_type_override
@@ -320,7 +281,7 @@ class ParallelDroplessMoE(torch.nn.Module):
         expert_weights, expert_indices, scores = self.router(x, router_type_override=router_type_override)
 
         # return value should be
-        output, trim_idx, expert_output = self.experts(x, expert_weights, expert_indices, scores, router_type=router_type)
+        output, expert_output = self.experts(x, expert_weights, expert_indices, router_type=router_type)
 
         if router_type == "dense_approx":
           attention_scores = attention_scores.mean(dim=1).unsqueeze(1).expand(-1, self.experts.num_experts, -1, -1).clone()
@@ -359,15 +320,15 @@ class ParallelDroplessMoE(torch.nn.Module):
             min_val = torch.finfo(expert_output.dtype).min
             threshold_val = 1 - 2/self.experts.num_experts
             def threshold_fn(score, b, h, q_idx, kv_idx):
-                return score + (score > threshold_val) * min_val
+                return score + (score < threshold_val) * min_val
             
             expert_routed_mask = torch.zeros(expert_indices.shape[0], self.experts.num_experts, dtype=torch.bool).to(expert_indices.device)
             expert_routed_mask.scatter_(1, expert_indices, 1)
 
-            input_queries = x.view(-1, x.shape[-1])[bucket_indices].unsqueeze(1).expand(-1, self.experts.num_experts, -1)
-            input_keys = x.view(-1, x.shape[-1])[bucket_indices].unsqueeze(1).expand(-1, self.experts.num_experts, -1)
-            # input_queries = queries.mean(dim=2, keepdim=True).expand(-1, -1, self.experts.num_experts, -1).transpose(0, 1).reshape(expert_indices.shape[0], self.experts.num_experts, -1)[bucket_indices]
-            # input_keys = keys.mean(dim=2, keepdim=True).expand(-1, -1, self.experts.num_experts, -1).transpose(0, 1).reshape(expert_indices.shape[0], self.experts.num_experts, -1)[bucket_indices]
+            # input_queries = x.view(-1, x.shape[-1])[bucket_indices].unsqueeze(1).expand(-1, self.experts.num_experts, -1)
+            # input_keys = x.view(-1, x.shape[-1])[bucket_indices].unsqueeze(1).expand(-1, self.experts.num_experts, -1)
+            input_queries = queries.mean(dim=2, keepdim=True).expand(-1, -1, self.experts.num_experts, -1).transpose(0, 1).reshape(expert_indices.shape[0], self.experts.num_experts, -1)[bucket_indices]
+            input_keys = keys.mean(dim=2, keepdim=True).expand(-1, -1, self.experts.num_experts, -1).transpose(0, 1).reshape(expert_indices.shape[0], self.experts.num_experts, -1)[bucket_indices]
             n_chunks = 4
             chunk_size = input_queries.shape[0] // n_chunks
             chunk_queries = input_queries.view(n_chunks, chunk_size, self.experts.num_experts, -1).transpose(1, 2)
@@ -383,14 +344,13 @@ class ParallelDroplessMoE(torch.nn.Module):
                 return (
                         (bucket_ids[q_idx] == bucket_ids[kv_idx])
                         & ~bucket_expert_mask[q_idx, h]
-                        & (bucket_expert_mask[kv_idx, h] | (bucket_indices[kv_idx] < trim_idx)) 
-                        & (bucket_indices[q_idx] >= trim_idx)
+                        & bucket_expert_mask[kv_idx, h]
                 )
 
             # sparsity: ~98%
             block_mask = create_block_mask(mask_fn, B=n_chunks, H=self.experts.num_experts, Q_LEN=chunk_size, KV_LEN=chunk_size)
 
-            attn_result = flex_attention(chunk_queries/scale, chunk_keys/scale, chunk_values, block_mask=block_mask, score_mod=threshold_fn)
+            attn_result = flex_attention(chunk_queries/scale, chunk_keys/scale, chunk_values, block_mask=block_mask)
             attn_result = attn_result.transpose(1, 2).flatten(0, 1)
             attn_result = torch.where(torch.isnan(attn_result), 0, attn_result)
 
@@ -400,14 +360,6 @@ class ParallelDroplessMoE(torch.nn.Module):
         
         if router_type == "dense_approx_efficient":
             bsz = queries.shape[0]
-            def orig_mask_fn(b, h, q_idx, kv_idx):
-                # row token has attn to col token if row isn't from expert and either col is, or col is dense token in seq
-                # or no attn at all if row was part of dense tokens
-                return (
-                    expert_indices[q_idx * bsz + b].ne(h).all(dim=-1) 
-                    & (expert_indices[kv_idx * bsz + b].eq(h).any(dim=-1) | (kv_idx < trim_idx)) 
-                    & (q_idx >= trim_idx)
-                )
 
             def mask_fn(b, h, q_idx, kv_idx):
                 # expert indices is sl x bs x nexperts
@@ -416,11 +368,8 @@ class ParallelDroplessMoE(torch.nn.Module):
                 # and row token isn't a dense token
                 return (
                     expert_indices[q_idx * bsz + b].ne(h).all(dim=-1) 
-                    & (expert_indices[kv_idx * bsz + b].eq(h).any(dim=-1) 
-                       | ((kv_idx < trim_idx) 
-                           & (expert_indices[q_idx * bsz + b] == expert_indices[kv_idx * bsz + b]).any(dim=-1))
-                      )
-                    & (q_idx >= trim_idx))
+                    & (expert_indices[kv_idx * bsz + b].eq(h).any(dim=-1))
+                )
 
             block_mask = create_block_mask(mask_fn, B=bsz, H=self.experts.num_experts, Q_LEN=queries.shape[1], KV_LEN=queries.shape[1])
 
@@ -446,8 +395,37 @@ class ParallelDroplessMoE(torch.nn.Module):
             return output + approx_output, None
 
         if router_type == "expert_prob_approx":
-            # for expert 0
-            # get all inputs that didn't go expert 0
-            # get highest probs to expert 0, grouped by expert
-            pass
+            # ntokens x topk -> ntokens x nexperts x topk
+            expert_indices_expanded = expert_indices.unsqueeze(1).expand(-1, self.experts.num_experts, -1)
+            # ntokens x nexperts -> ntokens x nexperts x 1
+            scores_expanded = scores.unsqueeze(2)
+            
+            # 1 x nexperts x 1
+            expert_range = torch.arange(self.experts.num_experts, device=expert_indices.device).unsqueeze(0).unsqueeze(2)
+            # ntokens x nexperts x topk == 1 x nexperts x 1 broadcasted, any/all -> ntokens x nexperts
+            routed_mask = (expert_indices_expanded == expert_range).any(dim=-1)
+            
+            # ntokens x nexperts x nexperts
+            # for each token, i,j true if routed to j, not routed to i, and above threshold score for i
+            # top_mask[:, cur_expert, target_expert] equivalent to for loop
+            # threshold = np.sqrt(1/((self.top_k+1)*self.neox_args.moe_num_experts))
+            threshold = 0
+            top_mask = ((routed_mask.unsqueeze(2) & routed_mask.unsqueeze(1)) + scores_expanded) > 1 + threshold
+
+            # not routed to i, routed to j, select output it had for j for all i, sum, average
+            # nexperts x nexperts x hidden_dim divided by nexperts x nexperts x 1
+            # note by nature of the mask, diagonal entries are 0
+            # -> approx for expert j, for tokens not routed to j but routed to i
+            weighted_mask = top_mask * scores.unsqueeze(1)
+            approx = torch.einsum('nij,njd->ijd', weighted_mask, expert_output) / weighted_mask.sum(dim=0).unsqueeze(-1).clamp(min=1)
+
+            # ntokens x nexperts x nexperts
+            # for each token, i,j true if a token was routed to i and we want approx for j
+            approx_mask = (routed_mask.unsqueeze(2) & ~routed_mask.unsqueeze(1))
+            # select entries with mask, sum over dimension corresponding to i from above to get aggregate approx for expert j,
+            # divide by topk as there will be k instances in the approx_mask where a token was routed to i
+            # ntokens x nexperts x nexperts x 1 * nexperts x nexperts x hidden_dim -> sum -> ntokens x nexperts x hidden_dim
+            # now this is the same shape as the buffer and fills in missing values with approximations
+            approx_output = torch.matmul((scores.unsqueeze(1) * approx_mask).flatten(1, 2), approx.flatten(0, 1) / self.experts.top_k).view(x.shape)
+            return output + approx_output, None
         return output, None
