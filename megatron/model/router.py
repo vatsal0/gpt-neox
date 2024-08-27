@@ -281,7 +281,7 @@ class Router(torch.nn.Module):
 
         if router_type_override is None:
           # only do this for the actual forward pass
-          routing_counts = torch.bincount(expert_indices.squeeze(1),minlength=self.num_experts)
+          routing_counts = torch.bincount(expert_indices.squeeze(1).flatten(),minlength=self.num_experts)
           global_routing_counts = torch.distributed.all_reduce(
                   routing_counts,
                   group=self.data_parallel_group,

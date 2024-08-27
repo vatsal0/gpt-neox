@@ -356,7 +356,7 @@ class ParallelDroplessMoE(torch.nn.Module):
 
             approx_output = (scores[bucket_indices].unsqueeze(-1) * attn_result).sum(dim=1)
 
-            return output.view(approx_output.shape).index_add_(dim=0, index=bucket_indices, source=approx_output).view(x.shape), None
+            return output.view(approx_output.shape).index_add(dim=0, index=bucket_indices, source=approx_output).view(x.shape), None
         
         if router_type == "dense_approx_efficient":
             bsz = queries.shape[0]
@@ -417,7 +417,7 @@ class ParallelDroplessMoE(torch.nn.Module):
             # note by nature of the mask, diagonal entries are 0
             # -> approx for expert j, for tokens not routed to j but routed to i
             weighted_mask = top_mask * scores.unsqueeze(1)
-            approx = torch.einsum('nij,njd->ijd', weighted_mask, expert_output) / weighted_mask.sum(dim=0).unsqueeze(-1).clamp(min=1)
+            approx = torch.einsum('nij,njd->ijd', top_mask.to(dtype=expert_output.dtype), expert_output) / top_mask.sum(dim=0).unsqueeze(-1).clamp(min=1)
 
             # ntokens x nexperts x nexperts
             # for each token, i,j true if a token was routed to i and we want approx for j
@@ -427,5 +427,5 @@ class ParallelDroplessMoE(torch.nn.Module):
             # ntokens x nexperts x nexperts x 1 * nexperts x nexperts x hidden_dim -> sum -> ntokens x nexperts x hidden_dim
             # now this is the same shape as the buffer and fills in missing values with approximations
             approx_output = torch.matmul((scores.unsqueeze(1) * approx_mask).flatten(1, 2), approx.flatten(0, 1) / self.experts.top_k).view(x.shape)
-            return output + approx_output, None
+            return output + approx_output - approx_output.detach(), None
         return output, None

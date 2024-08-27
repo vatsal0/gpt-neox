@@ -1118,18 +1118,18 @@ class ParallelTransformerLayer(nn.Module):
             layernorm_output = self.post_attention_layernorm(attention_output)
 
             # call signatures of both dense and MoE are the same
-            mlp_output, mlp_bias = self.mlp(layernorm_output, attention_scores, queries=queries, keys=keys)
-
             if self.simulate_router_gradients:
-                for router_type in ["topk", "sparsemixer", "dense_approx", "dense"]:
+                for router_type in ["topk", "sparsemixer", "dense_approx_efficient", "dense_approx_lsh", "expert_prob_approx", "dense"]:
                     with torch.enable_grad():
-                      _mlp_output, _mlp_bias = self.mlp(layernorm_output, router_type_override=router_type)
+                      _mlp_output, _mlp_bias = self.mlp(layernorm_output, attention_scores, queries=queries, keys=keys, router_type_override=router_type)
                     router_grads = torch.autograd.grad(
                         outputs=_mlp_output, 
                         inputs=self.mlp.router.layer.weight, 
                         grad_outputs=torch.ones_like(_mlp_output)
                     )[0]
                     self.router_grads[router_type] = router_grads.cpu().flatten().float()
+            
+            mlp_output, mlp_bias = self.mlp(layernorm_output, attention_scores, queries=queries, keys=keys)
 
             with torch.enable_grad():
                 # dense llama MLP and MoE don't support bias
