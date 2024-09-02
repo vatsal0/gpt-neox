@@ -45,6 +45,9 @@ from megatron.model.word_embeddings import EmbeddingPipe, SoftEmbedding
 from deepspeed.pipe import PipelineModule, LayerSpec, TiedLayerSpec
 from typing import Union, List
 
+from liger_kernel.transformers.cross_entropy import LigerCrossEntropyLoss
+cross_entropy_loss = LigerCrossEntropyLoss()
+
 
 def gpt2_attention_mask_func(attention_scores, ltor_mask):
     mask_value = torch.finfo(attention_scores.dtype).min
@@ -68,6 +71,7 @@ def cross_entropy(output, labels, _fp16=False):
         return loss
     """
     labels, loss_mask = labels[0], labels[1]
+    return cross_entropy_loss(output.view(-1, output.shape[-1]), labels.view(-1))
     if _fp16:
         assert output.dtype == torch.half and loss_mask.dtype == torch.half
         losses = mpu.vocab_parallel_cross_entropy(output.contiguous(), labels)

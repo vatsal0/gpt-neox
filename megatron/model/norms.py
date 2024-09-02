@@ -14,11 +14,11 @@
 
 import torch
 from torch.nn import LayerNorm as LayerNorm
-
+from liger_kernel.transformers.rms_norm import LigerRMSNorm
 
 def get_norm(neox_args):
     if neox_args.norm == "rmsnorm":
-        norm = RMSNorm
+        norm = LigerRMSNorm
         eps = neox_args.rms_norm_epsilon
     elif neox_args.norm == "layernorm":
         eps = neox_args.layernorm_epsilon

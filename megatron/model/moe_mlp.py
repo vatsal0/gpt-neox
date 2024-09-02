@@ -26,6 +26,8 @@ from megatron.neox_arguments.arguments import NeoXArgs
 
 from megablocks import grouped_gemm_util as gg
 
+from liger_kernel.ops.swiglu import LigerSiLUMulFunction
+from liger_kernel.ops.geglu import LigerGELUMulFunction
 
 class ScaleGradient(torch.autograd.Function):
     @staticmethod
@@ -437,6 +439,12 @@ class ParallelGroupedLLaMAMLP(torch.nn.Module):
         llama_x_w1T = gg.ops.gmm(x, w1, grouped_gemm_batch_sizes, trans_b=True)
 
         llama_x_w3T = gg.ops.gmm(x, w3, grouped_gemm_batch_sizes, trans_b=True)
+
+        if self.activation_func.__name__ == 'gelu':
+            return gg.ops.gmm(LigerGELUMulFunction.apply(llama_x_w1T, llama_x_w3T), w2, grouped_gemm_batch_sizes)
+        
+        if self.activation_func.__name__ == 'silu':
+            return gg.ops.gmm(LigerSiLUMulFunction.apply(llama_x_w1T, llama_x_w3T), w2, grouped_gemm_batch_sizes)
 
         llama_act_x_w1T = self.activation_func(llama_x_w1T)
 
