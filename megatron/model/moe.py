@@ -395,37 +395,39 @@ class ParallelDroplessMoE(torch.nn.Module):
             return output + approx_output, None
 
         if router_type == "expert_prob_approx":
+            group_topk = 2
+            _, group_indices = scores.topk(k=group_topk, dim=-1)
+            group_indices_expanded = group_indices.unsqueeze(1).expand(-1, self.experts.num_experts, -1)
+
             # ntokens x topk -> ntokens x nexperts x topk
             expert_indices_expanded = expert_indices.unsqueeze(1).expand(-1, self.experts.num_experts, -1)
-            # ntokens x nexperts -> ntokens x nexperts x 1
-            scores_expanded = scores.unsqueeze(2)
             
             # 1 x nexperts x 1
             expert_range = torch.arange(self.experts.num_experts, device=expert_indices.device).unsqueeze(0).unsqueeze(2)
             # ntokens x nexperts x topk == 1 x nexperts x 1 broadcasted, any/all -> ntokens x nexperts
             routed_mask = (expert_indices_expanded == expert_range).any(dim=-1)
+            group_mask = (group_indices_expanded == expert_range).any(dim=-1)
             
             # ntokens x nexperts x nexperts
-            # for each token, i,j true if routed to j, not routed to i, and above threshold score for i
-            # top_mask[:, cur_expert, target_expert] equivalent to for loop
-            # threshold = np.sqrt(1/((self.top_k+1)*self.neox_args.moe_num_experts))
-            threshold = 0
-            top_mask = ((routed_mask.unsqueeze(2) & routed_mask.unsqueeze(1)) + scores_expanded) > 1 + threshold
+            # row: which groups token belongs to; col: which expert outputs token will contribute to the group for approx
+            if self.experts.top_k < group_topk:
+                # token does not have outputs for its groups that are not in the experts top k
+                top_mask = group_mask.unsqueeze(2) & routed_mask.unsqueeze(1)
+            else:
+                top_mask = group_mask.unsqueeze(2) & group_mask.unsqueeze(1)
 
-            # not routed to i, routed to j, select output it had for j for all i, sum, average
             # nexperts x nexperts x hidden_dim divided by nexperts x nexperts x 1
-            # note by nature of the mask, diagonal entries are 0
-            # -> approx for expert j, for tokens not routed to j but routed to i
+            # average of each expert outputs for tokens in the group that contributed an expert output
             weighted_mask = top_mask * scores.unsqueeze(1)
             approx = torch.einsum('nij,njd->ijd', top_mask.to(dtype=expert_output.dtype), expert_output) / top_mask.sum(dim=0).unsqueeze(-1).clamp(min=1)
 
             # ntokens x nexperts x nexperts
             # for each token, i,j true if a token was routed to i and we want approx for j
-            approx_mask = (routed_mask.unsqueeze(2) & ~routed_mask.unsqueeze(1))
-            # select entries with mask, sum over dimension corresponding to i from above to get aggregate approx for expert j,
-            # divide by topk as there will be k instances in the approx_mask where a token was routed to i
+            # row: groups a token will use for approx; col: which expert outputs a token needs
+            # ideally, token group is consistent between rows of top_mask and approx_mask
+            approx_mask = (group_mask.unsqueeze(2) & ~routed_mask.unsqueeze(1))
             # ntokens x nexperts x nexperts x 1 * nexperts x nexperts x hidden_dim -> sum -> ntokens x nexperts x hidden_dim
-            # now this is the same shape as the buffer and fills in missing values with approximations
-            approx_output = torch.matmul((scores.unsqueeze(1) * approx_mask).flatten(1, 2), approx.flatten(0, 1) / self.experts.top_k).view(x.shape)
+            # divide by num of groups a token used for one expert approx
+            approx_output = torch.matmul((scores.unsqueeze(1) * approx_mask).flatten(1, 2), approx.flatten(0, 1) / group_topk).view(x.shape)
             return output + approx_output - approx_output.detach(), None
         return output, None
