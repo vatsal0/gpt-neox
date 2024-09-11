@@ -26,8 +26,6 @@ print('start compiling')
 kernel = torch.compile(launch_lsh_approximation_kernel)
 print('done compiling')
 
-from xformers.components.attention import ScaledDotProduct
-
 from torch.nn.attention.flex_attention import flex_attention
 from torch.nn.attention.flex_attention import create_block_mask
 
@@ -262,7 +260,17 @@ class ParallelDroplessMoE(torch.nn.Module):
             output_layer_init_method,
         )
 
+        self.group_topk = neox_args.group_top_k
         self.attention = ScaledDotProduct().cuda()
+        self.stats = {
+            'avg_sim_0': 0,
+            'avg_sim_1': 0,
+            'avg_sim_2': 0,
+            'pct_sim_0': 0,
+            'pct_sim_1': 0,
+            'pct_sim_2': 0,
+            'exp_avg_sim': 0,
+        }
 
     def forward(self, x, attention_scores, queries=None, keys=None, router_type_override=None):
         router_type = router_type_override
@@ -395,8 +403,7 @@ class ParallelDroplessMoE(torch.nn.Module):
             return output + approx_output, None
 
         if router_type == "expert_prob_approx":
-            group_topk = 2
-            _, group_indices = scores.topk(k=group_topk, dim=-1)
+            _, group_indices = scores.topk(k=self.group_topk, dim=-1)
             group_indices_expanded = group_indices.unsqueeze(1).expand(-1, self.experts.num_experts, -1)
 
             # ntokens x topk -> ntokens x nexperts x topk
@@ -410,7 +417,7 @@ class ParallelDroplessMoE(torch.nn.Module):
             
             # ntokens x nexperts x nexperts
             # row: which groups token belongs to; col: which expert outputs token will contribute to the group for approx
-            if self.experts.top_k < group_topk:
+            if self.experts.top_k < self.group_topk:
                 # token does not have outputs for its groups that are not in the experts top k
                 top_mask = group_mask.unsqueeze(2) & routed_mask.unsqueeze(1)
             else:
@@ -420,6 +427,48 @@ class ParallelDroplessMoE(torch.nn.Module):
             # average of each expert outputs for tokens in the group that contributed an expert output
             weighted_mask = top_mask * scores.unsqueeze(1)
             approx = torch.einsum('nij,njd->ijd', top_mask.to(dtype=expert_output.dtype), expert_output) / top_mask.sum(dim=0).unsqueeze(-1).clamp(min=1)
+   
+            if False: # with torch.no_grad():
+              N = expert_indices.shape[0]
+              batch = N//8
+              counts = torch.zeros(N, N, dtype=torch.uint8, device=expert_indices.device)
+              
+              for i in range(0, N, batch):
+                  counts[i:i+batch].add_((expert_indices.unsqueeze(1).unsqueeze(3)[i:i+batch] == expert_indices.unsqueeze(1)).sum(dim=[2, 3]))
+              
+              norms = x.flatten(0, 1).norm(2, dim=-1, keepdim=True).clamp(min=1e-3)
+              sims = torch.einsum('nd,dm->nm', x.flatten(0, 1)/norms, (x.flatten(0, 1)/norms).T)
+
+              threshold = 0.75
+
+              for k in range(3):
+                avg_sim = 0; pct_above = 0
+                for i in range(0, N, batch): 
+                  idx = (counts[i:i+batch] == k)
+                  avg_sim += sims[i:i+batch][idx].float().mean()
+                  pct_above += (sims[i:i+batch][idx] > threshold).float().mean()
+                avg_sim /= (N//batch); pct_above /= (N//batch)
+                self.stats[f'avg_sim_{k}'] += avg_sim
+                self.stats[f'pct_sim_{k}'] += pct_above
+                # print(f'When two inputs have {k} experts in common: average similarity={avg_sim.item():0.4f} proportion with >{threshold:0.2f} similarity={pct_above.item():0.4f}')
+
+              exp_avg_sim = 0
+              for e in range(expert_output.shape[1]):
+                  out = expert_output[:, e, :]
+                  out_norms = out.norm(2, dim=-1, keepdim=True).clamp(min=1e-3)
+                  out_sims = torch.einsum('nd,dm->nm', out/out_norms, (out/out_norms).T)
+
+                  exp_sim = 0
+                  tot = 0
+                  for i in range(0, N, batch): 
+                      idx = (sims[i:i+batch] > threshold) & routed_mask[:, e][i:i+batch].unsqueeze(1) & routed_mask[:, e].unsqueeze(0)
+                      exp_sim += out_sims[i:i+batch][idx].float().sum()
+                      tot += idx.sum()
+                  exp_sim /= tot.clamp(min=1)
+                  exp_avg_sim += exp_sim
+
+                  # print(f'Expert {e}: when two inputs routed to expert have >{threshold:0.2f} similarity: average output similarity={avg_sim.item():0.4f}')
+              self.stats['exp_avg_sim'] += exp_avg_sim / expert_output.shape[1]
 
             # ntokens x nexperts x nexperts
             # for each token, i,j true if a token was routed to i and we want approx for j
@@ -428,6 +477,6 @@ class ParallelDroplessMoE(torch.nn.Module):
             approx_mask = (group_mask.unsqueeze(2) & ~routed_mask.unsqueeze(1))
             # ntokens x nexperts x nexperts x 1 * nexperts x nexperts x hidden_dim -> sum -> ntokens x nexperts x hidden_dim
             # divide by num of groups a token used for one expert approx
-            approx_output = torch.matmul((scores.unsqueeze(1) * approx_mask).flatten(1, 2), approx.flatten(0, 1) / group_topk).view(x.shape)
+            approx_output = torch.matmul((scores.unsqueeze(1) * approx_mask).flatten(1, 2), approx.flatten(0, 1) / self.group_topk).view(x.shape)
             return output + approx_output - approx_output.detach(), None
         return output, None
