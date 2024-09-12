@@ -1120,6 +1120,7 @@ class ParallelTransformerLayer(nn.Module):
             # call signatures of both dense and MoE are the same
             if self.simulate_router_gradients:
                 for router_type in ["topk", "sparsemixer", "dense_approx_efficient", "dense_approx_lsh", "expert_prob_approx", "dense"]:
+                    if router_type == "sparsemixer" and self.mlp.experts.top_k > 2: continue
                     with torch.enable_grad():
                       _mlp_output, _mlp_bias = self.mlp(layernorm_output, attention_scores, queries=queries, keys=keys, router_type_override=router_type)
                     router_grads = torch.autograd.grad(
