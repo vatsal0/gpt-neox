@@ -942,6 +942,7 @@ class ParallelTransformerLayer(nn.Module):
         rpe=None,
         rotary=False,
         use_cache=False,
+        expert_buffer=None
     ):
 
         super().__init__()
@@ -952,6 +953,8 @@ class ParallelTransformerLayer(nn.Module):
         # Layernorm on the input data.
         self.input_layernorm = norm(neox_args.hidden_size, eps=eps)
         self.use_cache = use_cache
+
+        self.expert_buffer = expert_buffer
 
         self.hidden_dropout = neox_args.hidden_dropout
         self.bias_dropout_fusion = neox_args.bias_dropout_fusion
@@ -1122,7 +1125,7 @@ class ParallelTransformerLayer(nn.Module):
                 for router_type in ["topk", "sparsemixer", "dense_approx_efficient", "dense_approx_lsh", "expert_prob_approx", "dense"]:
                     if router_type == "sparsemixer" and self.mlp.experts.top_k > 2: continue
                     with torch.enable_grad():
-                      _mlp_output, _mlp_bias = self.mlp(layernorm_output, attention_scores, queries=queries, keys=keys, router_type_override=router_type)
+                      _mlp_output, _mlp_bias = self.mlp(layernorm_output, attention_scores, self.expert_buffer, queries=queries, keys=keys, router_type_override=router_type)
                     router_grads = torch.autograd.grad(
                         outputs=_mlp_output, 
                         inputs=self.mlp.router.layer.weight, 
@@ -1130,7 +1133,7 @@ class ParallelTransformerLayer(nn.Module):
                     )[0]
                     self.router_grads[router_type] = router_grads.cpu().flatten().float()
             
-            mlp_output, mlp_bias = self.mlp(layernorm_output, attention_scores, queries=queries, keys=keys)
+            mlp_output, mlp_bias = self.mlp(layernorm_output, attention_scores, self.expert_buffer, queries=queries, keys=keys)
 
             with torch.enable_grad():
                 # dense llama MLP and MoE don't support bias

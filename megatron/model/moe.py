@@ -76,7 +76,6 @@ class ParallelDroplessMLP(torch.nn.Module):
             raise KeyError(neox_args.mlp_type)
 
         self.total_approx_count = 0
-        self.buffer = None
 
     def indices_and_bins(self, top_expert: torch.Tensor):
         # Sort the expert ids to produce the scatter/gather
@@ -110,7 +109,7 @@ class ParallelDroplessMLP(torch.nn.Module):
         expert_weights: torch.Tensor,
         bins: torch.Tensor,
         top_k: int,
-        buffer: torch.Tensor,
+        expert_buffer: torch.Tensor,
     ):
         """
         grouped_permute_and_compute
@@ -142,7 +141,6 @@ class ParallelDroplessMLP(torch.nn.Module):
         """
         # Route the tokens for MoE computation.
         ## stack (sl, bs, hs) into (sl * bs, hs)
-        seq_len, batch_size = input_.shape[0], input_.shape[1]
         input_ = input_.view(-1, input_.shape[-1])
 
         ## repeat each token top_k times and shuffle tokens to group them by their respective experts
@@ -173,7 +171,7 @@ class ParallelDroplessMLP(torch.nn.Module):
         input_indices = indices // top_k
 
         # ith element of output will be added to index corresponding to input index, and associated expert
-        buffer.index_add_(dim=0, index=self.num_experts * input_indices + bin_ids, source=output.detach())
+        expert_buffer.index_add_(dim=0, index=self.num_experts * input_indices + bin_ids, source=output.detach())
 
         # Un-route the data for the MoE output
         return megablocks.ops.scatter(
@@ -185,7 +183,7 @@ class ParallelDroplessMLP(torch.nn.Module):
             top_k,
         )
 
-    def forward(self, x, expert_weights, expert_indices, router_type=None):
+    def forward(self, x, expert_weights, expert_indices, expert_buffer, router_type=None):
         """
         grouped_forward_once
 
@@ -196,12 +194,7 @@ class ParallelDroplessMLP(torch.nn.Module):
         # save shape so we can re-shape the outputs later
         in_shape = x.size()
 
-        seq_len, batch_size = x.shape[0], x.shape[1]
-
-        # initialize buffers here since we are calling permute_and_compute multiple times
-        if self.buffer is None:
-            self.buffer = torch.zeros((seq_len * batch_size * self.num_experts, x.size(-1))).to(x.device, dtype=x.dtype)
-        self.buffer.zero_()
+        expert_buffer.zero_()
 
         expert_weights = expert_weights.flatten()
         expert_indices = expert_indices.flatten()
@@ -219,16 +212,12 @@ class ParallelDroplessMLP(torch.nn.Module):
             expert_weights,
             bins,
             self.top_k if router_type != "dense" else self.num_experts,
-            self.buffer.view(-1, x.size(-1))
+            expert_buffer.view(-1, x.size(-1))
         )
 
         x = x.view(in_shape)
 
-        return x, self.buffer.view(
-            seq_len * batch_size, 
-            self.num_experts, 
-            x.size(-1)
-        )
+        return x
 
 
 def cast_if_autocast_enabled(tensor: torch.Tensor):
@@ -271,7 +260,7 @@ class ParallelDroplessMoE(torch.nn.Module):
             'exp_avg_sim': 0,
         }
 
-    def forward(self, x, attention_scores, queries=None, keys=None, router_type_override=None):
+    def forward(self, x, attention_scores, expert_buffer, queries=None, keys=None, router_type_override=None):
         router_type = router_type_override
         
         if router_type is None:
@@ -288,7 +277,13 @@ class ParallelDroplessMoE(torch.nn.Module):
         expert_weights, expert_indices, scores = self.router(x, router_type_override=router_type_override)
 
         # return value should be
-        output, expert_output = self.experts(x, expert_weights, expert_indices, router_type=router_type)
+        output = self.experts(x, expert_weights, expert_indices, expert_buffer, router_type=router_type)
+
+        expert_output = expert_buffer.view(
+            x.shape[0] * x.shape[1], 
+            self.experts.num_experts, 
+            x.size(-1)
+        )
 
         if router_type == "dense_approx":
           attention_scores = attention_scores.mean(dim=1).unsqueeze(1).expand(-1, self.experts.num_experts, -1, -1).clone()

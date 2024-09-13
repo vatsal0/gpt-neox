@@ -243,6 +243,11 @@ class GPT2ModelPipe(PipelineModule, torch.nn.Module):
                 heads=self.neox_args.num_attention_heads,
             )
 
+        self.expert_buffer = torch.zeros(
+            (self.neox_args.seq_length * self.neox_args.train_micro_batch_size_per_gpu * self.neox_args.moe_num_experts, 
+                self.neox_args.hidden_size
+            ), dtype=torch.bfloat16, device=torch.cuda.current_device())
+
         # Transformer layers
         for i in range(self.neox_args.num_layers):
             layer_type = self.neox_args.attention_config[i]
@@ -287,6 +292,7 @@ class GPT2ModelPipe(PipelineModule, torch.nn.Module):
                         rpe=rpe_emb if self.neox_args.pos_emb == "rpe" else None,
                         rotary=self.neox_args.pos_emb == "rotary",
                         use_cache=self.use_cache,
+                        expert_buffer = self.expert_buffer
                     )
                 )
 
