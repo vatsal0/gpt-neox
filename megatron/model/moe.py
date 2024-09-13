@@ -261,7 +261,6 @@ class ParallelDroplessMoE(torch.nn.Module):
         )
 
         self.group_topk = neox_args.group_top_k
-        self.attention = ScaledDotProduct().cuda()
         self.stats = {
             'avg_sim_0': 0,
             'avg_sim_1': 0,
