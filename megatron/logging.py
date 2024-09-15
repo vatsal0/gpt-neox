@@ -16,6 +16,7 @@ import sys
 
 import torch
 import re
+import os
 
 try:
     import wandb
@@ -146,43 +147,60 @@ def training_log(
         return max 
     
     routing = {}
-    approx_counts = {}
+    moe_stats = {}
     max_routed = 0
     # max_per_layer = {}
 
+    BUFFER_ITERS = 1000
+    if iteration % BUFFER_ITERS == 0:
+      for k,v in model.named_modules():
+          if k.endswith('.router'):
+              routing_counts = v.train_routing_count_buffer.view(BUFFER_ITERS, -1, *v.train_routing_count_buffer.shape[1:])
+              lbl_losses = v.lbl_loss_buffer.view(BUFFER_ITERS, -1, *v.lbl_loss_buffer.shape[1:])
+              if neox_args.save is not None:
+                  layer = re.search(r'\d+',k,).group()
+                  save_path = os.path.join(neox_args.save, f'buffer_dumps_{layer}')
+                  os.makedirs(save_path, exist_ok=True)
+                  torch.save(routing_counts, os.path.join(save_path, f'routing_counts_{iteration}.pt'))
+                  torch.save(lbl_losses, os.path.join(save_path, f'lbl_losses_{iteration}.pt'))
+              v.reset_logging_buffers()
+
     if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
         for k,v in model.named_modules():
-            if k.endswith('.router'):
-                temp = v.global_routing_counts.cpu()
-                routing[k] = {'expert_'+str(i):x.item() for i,x in enumerate(temp)}
+            # if k.endswith('.router'):
+                # temp = v.global_routing_counts.cpu()
+                # routing[k] = {'expert_'+str(i):x.item() for i,x in enumerate(temp)}
                 # max_per_layer[re.search(r'\d+',k,)] = temp.max()
-                max_routed = get_max(max_routed,temp)
-            if k.endswith('.experts'):
-                approx_counts[k] = v.total_approx_count
-                v.total_approx_count = 0
+                # max_routed = get_max(max_routed,temp)
+            if k.endswith('.mlp') and not k.endswith('.experts.mlp'):
+                moe_stats[k] = {stat:val/neox_args.gradient_accumulation_steps for stat, val in v.stats.items()}
+                for stat in v.stats.keys():
+                    v.stats[stat] = 0
 
     # neox_args.world_size should be the global world size
     balanced_tokens_per_exp = (neox_args.world_size * neox_args.seq_length * neox_args.train_micro_batch_size_per_gpu) / neox_args.moe_num_experts
     max_routing_imbalance = max_routed / balanced_tokens_per_exp
 
-    tb_wandb_log(
-        f'train/max_routing_imbalance',
-        max_routing_imbalance,
-        iteration,
-        use_wandb=neox_args.use_wandb,
-        tensorboard_writer=neox_args.tensorboard_writer,
-    )
+    # tb_wandb_log(
+    #     f'train/max_routing_imbalance',
+    #     max_routing_imbalance,
+    #     iteration,
+    #     use_wandb=neox_args.use_wandb,
+    #     tensorboard_writer=neox_args.tensorboard_writer,
+    # )
     # max_per_layer = {k:v/balanced_tokens_per_exp for k,v in max_per_layer.items()}
 
-    for layer,v in approx_counts.items():
-        temp = re.search(r'\d+',layer,).group()
-        tb_wandb_log(
-            f'train/layer_{temp}/approx_counts',
-            v,
-            iteration,
-            use_wandb=neox_args.use_wandb,
-            tensorboard_writer=neox_args.tensorboard_writer,
-        )
+    for layer,v in moe_stats.items():
+        for stat, val in v.items():
+          continue
+          temp = re.search(r'\d+',layer,).group()
+          tb_wandb_log(
+              f'train/layer_{temp}/{stat}',
+              val/2,
+              iteration,
+              use_wandb=neox_args.use_wandb,
+              tensorboard_writer=neox_args.tensorboard_writer,
+          )
     for layer,v in routing.items():
         for expert,tokens in v.items():
             temp = re.search(r'\d+',layer,).group()
@@ -270,24 +288,25 @@ def training_log(
     if neox_args.simulate_router_gradients:
         # does not work yet for multiple gpus :(
         children = [child for child in model.module.children()]
-        router_grads = children[2].router_grads
-        for router_type, grad in router_grads.items():
-            tb_wandb_log(
-                f'train/{router_type}_grad_norm_layer0',
-                torch.linalg.vector_norm(grad),
-                iteration,
-                use_wandb=neox_args.use_wandb,
-                tensorboard_writer=neox_args.tensorboard_writer,
-            )
+        for i, child in enumerate(children[2:10]):
+          router_grads = child.router_grads
+          for router_type, grad in router_grads.items():
+              if router_type != "dense":
+                  tb_wandb_log(
+                      f'train/layer_{i}/dense_grad_norm_ratio_{router_type}',
+                      torch.linalg.vector_norm(grad)/torch.linalg.vector_norm(router_grads['dense']),
+                      iteration,
+                      use_wandb=neox_args.use_wandb,
+                      tensorboard_writer=neox_args.tensorboard_writer,
+                  )
 
-            if router_type != "dense":
-                tb_wandb_log(
-                  f'train/{router_type}_dense_grad_sim_layer0',
-                  torch.nn.functional.cosine_similarity(grad, router_grads['dense'], dim=0),
-                  iteration,
-                  use_wandb=neox_args.use_wandb,
-                  tensorboard_writer=neox_args.tensorboard_writer,
-              )
+                  tb_wandb_log(
+                    f'train/layer_{i}/dense_grad_sim_{router_type}',
+                    torch.nn.functional.cosine_similarity(grad, router_grads['dense'], dim=0),
+                    iteration,
+                    use_wandb=neox_args.use_wandb,
+                    tensorboard_writer=neox_args.tensorboard_writer,
+                )
 
     for key in loss_dict:
         tb_wandb_log(

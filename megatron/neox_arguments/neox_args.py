@@ -1311,7 +1311,4 @@ class NeoXArgsMoE(NeoXArgsTemplate):
     the gradient compared to the dense gradient.
     """
 
-    load_balancing: bool = True
-    """
-    Whether to apply the Switch Transformer's load balancing loss.
-    """
+    moe_aux_loss_coeff: float = 0.0
