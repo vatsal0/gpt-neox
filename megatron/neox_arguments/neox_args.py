@@ -1288,7 +1288,7 @@ class NeoXArgsMoE(NeoXArgsTemplate):
     The number of top experts to group tokens by in the expert group approximation.
     """
 
-    moe_router_type: Literal["sinkhorn", "topk", "sparsemixer", "dense_approx", "dense_approx_lsh", "dense_approx_efficient", "expert_prob_approx"] = "sinkhorn"
+    moe_router_type: Literal["sinkhorn", "topk", "sparsemixer", "dense_approx", "dense_approx_lsh", "dense_approx_efficient", "expert_prob_approx", "dense"] = "sinkhorn"
     """
     What token routing algorithm to use. Currently only sinkhorn is supported for training.
     TopK is only used for inference/eval.

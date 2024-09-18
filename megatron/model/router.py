@@ -101,16 +101,12 @@ class Router(torch.nn.Module):
 
         logits = self.layer(x.view(-1, x.shape[-1]))
         
-        if router_type == "topk" or router_type == "dense_approx" or router_type == "dense_approx_lsh" or router_type == "dense_approx_efficient" or router_type == "expert_prob_approx":
+        if router_type == "topk" or router_type == "dense_approx" or router_type == "dense_approx_lsh" or router_type == "dense_approx_efficient" or router_type == "expert_prob_approx" or router_type == "dense":
             scores = logits.softmax(dim=-1)
             expert_weights, expert_indices = self._top_k(scores)
         
         elif router_type == "sparsemixer":
             expert_weights, scores, expert_indices = sparsemixerv2_routing(logits, self.top_k, self.jitter_eps, self.training)
-
-        elif router_type == "dense":
-            scores = logits.softmax(dim=-1)
-            expert_weights, expert_indices = torch.topk(scores, self.num_experts, dim=-1)
 
         else:
             raise ValueError(f"Invalid MoE Router type {router_type}")

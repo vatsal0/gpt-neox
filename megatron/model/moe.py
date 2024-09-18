@@ -183,7 +183,7 @@ class ParallelDroplessMLP(torch.nn.Module):
             top_k,
         )
 
-    def forward(self, x, expert_weights, expert_indices, expert_buffer, router_type=None):
+    def forward(self, x, expert_weights, expert_indices, expert_buffer, dense=False):
         """
         grouped_forward_once
 
@@ -211,7 +211,7 @@ class ParallelDroplessMLP(torch.nn.Module):
             bin_ids,
             expert_weights,
             bins,
-            self.top_k if router_type != "dense" else self.num_experts,
+            self.top_k if not dense else self.num_experts,
             expert_buffer.view(-1, x.size(-1))
         )
 
@@ -277,13 +277,20 @@ class ParallelDroplessMoE(torch.nn.Module):
         expert_weights, expert_indices, scores = self.router(x, router_type_override=router_type_override)
 
         # return value should be
-        output = self.experts(x, expert_weights, expert_indices, expert_buffer, router_type=router_type)
+        output = self.experts(x, expert_weights, expert_indices, expert_buffer)
 
         expert_output = expert_buffer.view(
             x.shape[0] * x.shape[1], 
             self.experts.num_experts, 
             x.size(-1)
         )
+
+        if router_type == "dense":
+            all_indices = torch.arange(
+                self.experts.num_experts, dtype=expert_indices.dtype, device=expert_indices.device
+            ).expand(expert_indices.shape[0], -1)
+            dense_output = self.experts(x, scores, all_indices, expert_buffer, dense=True)
+            return dense_output - dense_output.detach() + output.detach(), None
 
         if router_type == "dense_approx":
           attention_scores = attention_scores.mean(dim=1).unsqueeze(1).expand(-1, self.experts.num_experts, -1, -1).clone()
