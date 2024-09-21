@@ -1312,3 +1312,5 @@ class NeoXArgsMoE(NeoXArgsTemplate):
     """
 
     moe_aux_loss_coeff: float = 0.0
+
+    log_sims: bool = False

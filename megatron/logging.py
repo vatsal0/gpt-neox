@@ -151,7 +151,7 @@ def training_log(
     max_routed = 0
     # max_per_layer = {}
 
-    BUFFER_ITERS = 1000
+    BUFFER_ITERS = 250
     if iteration % BUFFER_ITERS == 0:
       for k,v in model.named_modules():
           if k.endswith('.router'):
@@ -159,7 +159,8 @@ def training_log(
               lbl_losses = v.lbl_loss_buffer.view(BUFFER_ITERS, -1, *v.lbl_loss_buffer.shape[1:])
               if neox_args.save is not None:
                   layer = re.search(r'\d+',k,).group()
-                  save_path = os.path.join(neox_args.save, f'buffer_dumps_{layer}')
+                  rank = 0 if not torch.distributed.is_initialized() else torch.distributed.get_rank()
+                  save_path = os.path.join(neox_args.save, f'buffer_dumps_layer{layer}_rank{rank}')
                   os.makedirs(save_path, exist_ok=True)
                   torch.save(routing_counts, os.path.join(save_path, f'routing_counts_{iteration}.pt'))
                   torch.save(lbl_losses, os.path.join(save_path, f'lbl_losses_{iteration}.pt'))
@@ -173,7 +174,7 @@ def training_log(
                 # max_per_layer[re.search(r'\d+',k,)] = temp.max()
                 # max_routed = get_max(max_routed,temp)
             if k.endswith('.mlp') and not k.endswith('.experts.mlp'):
-                moe_stats[k] = {stat:val/neox_args.gradient_accumulation_steps for stat, val in v.stats.items()}
+                moe_stats[k] = {stat:val/(neox_args.gradient_accumulation_steps * neox_args.world_size) for stat, val in v.stats.items()}
                 for stat in v.stats.keys():
                     v.stats[stat] = 0
 
@@ -190,17 +191,17 @@ def training_log(
     # )
     # max_per_layer = {k:v/balanced_tokens_per_exp for k,v in max_per_layer.items()}
 
-    for layer,v in moe_stats.items():
-        for stat, val in v.items():
-          continue
-          temp = re.search(r'\d+',layer,).group()
-          tb_wandb_log(
-              f'train/layer_{temp}/{stat}',
-              val/2,
-              iteration,
-              use_wandb=neox_args.use_wandb,
-              tensorboard_writer=neox_args.tensorboard_writer,
-          )
+    if neox_args.log_sims:
+      for layer,v in moe_stats.items():
+          for stat, val in v.items():
+            temp = re.search(r'\d+',layer,).group()
+            tb_wandb_log(
+                f'train/layer_{temp}/{stat}',
+                val/2,
+                iteration,
+                use_wandb=neox_args.use_wandb,
+                tensorboard_writer=neox_args.tensorboard_writer,
+            )
     for layer,v in routing.items():
         for expert,tokens in v.items():
             temp = re.search(r'\d+',layer,).group()

@@ -71,7 +71,7 @@ def cross_entropy(output, labels, _fp16=False):
         return loss
     """
     labels, loss_mask = labels[0], labels[1]
-    return cross_entropy_loss(output.view(-1, output.shape[-1]), labels.view(-1))
+    return cross_entropy_loss(output[0].view(-1, output[0].shape[-1]), labels.view(-1))
     if _fp16:
         assert output.dtype == torch.half and loss_mask.dtype == torch.half
         losses = mpu.vocab_parallel_cross_entropy(output.contiguous(), labels)
