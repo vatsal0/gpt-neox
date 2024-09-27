@@ -162,7 +162,7 @@ def init_wandb(neox_args):
     if not neox_args.wandb_init_all_ranks:
         use_wandb = is_local_main() and (
             get_wandb_api_key(neox_args=neox_args) is not None
-        )
+        ) and neox_args.rank == 0
         neox_args.update_value("use_wandb", use_wandb)
     if neox_args.use_wandb:
         group_name = neox_args.wandb_group

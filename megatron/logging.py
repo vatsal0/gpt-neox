@@ -174,7 +174,7 @@ def training_log(
                   torch.save(z_losses, os.path.join(save_path, f'z_losses_{iteration}.pt'))
               v.reset_logging_buffers()
 
-    if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+    if neox_args.log_sims and (not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0):
         from megatron.model.moe import ParallelDroplessMoE
         for k,v in model.named_modules():
             # if k.endswith('.router'):
@@ -200,7 +200,7 @@ def training_log(
     # )
     # max_per_layer = {k:v/balanced_tokens_per_exp for k,v in max_per_layer.items()}
 
-    if neox_args.log_sims:
+    if neox_args.log_sims and (not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0):
       for layer,v in moe_stats.items():
           for stat, val in v.items():
             temp = re.search(r'\d+',layer,).group()
