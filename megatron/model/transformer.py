@@ -963,7 +963,7 @@ class ParallelTransformerLayer(nn.Module):
         self.mlp_type = neox_args.mlp_type
         self.num_experts = (
             neox_args.moe_num_experts
-            if layer_number % neox_args.moe_expert_interval == 0
+            if layer_number > 0 and layer_number % neox_args.moe_expert_interval == 0
             else 1
         )
 
@@ -1120,20 +1120,23 @@ class ParallelTransformerLayer(nn.Module):
             # output = x + mlp(ln2(x))
             layernorm_output = self.post_attention_layernorm(attention_output)
 
-            # call signatures of both dense and MoE are the same
-            if self.simulate_router_gradients:
-                for router_type in ["topk", "sparsemixer", "dense_approx_efficient", "dense_approx_lsh", "expert_prob_approx", "dense"]:
-                    if router_type == "sparsemixer" and self.mlp.experts.top_k > 2: continue
-                    with torch.enable_grad():
-                      _mlp_output, _mlp_bias = self.mlp(layernorm_output, attention_scores, self.expert_buffer, queries=queries, keys=keys, router_type_override=router_type)
-                    router_grads = torch.autograd.grad(
-                        outputs=_mlp_output, 
-                        inputs=self.mlp.router.layer.weight, 
-                        grad_outputs=torch.ones_like(_mlp_output)
-                    )[0]
-                    self.router_grads[router_type] = router_grads.cpu().flatten().float()
-            
-            mlp_output, mlp_bias = self.mlp(layernorm_output, attention_scores, self.expert_buffer, queries=queries, keys=keys)
+            if self.num_experts > 1:
+              # call signatures of both dense and MoE are the same
+              if self.simulate_router_gradients:
+                  for router_type in ["topk", "sparsemixer", "dense_approx_efficient", "dense_approx_lsh", "expert_prob_approx", "dense"]:
+                      if router_type == "sparsemixer" and self.mlp.experts.top_k > 2: continue
+                      with torch.enable_grad():
+                        _mlp_output, _mlp_bias = self.mlp(layernorm_output, attention_scores, self.expert_buffer, queries=queries, keys=keys, router_type_override=router_type)
+                      router_grads = torch.autograd.grad(
+                          outputs=_mlp_output, 
+                          inputs=self.mlp.router.layer.weight, 
+                          grad_outputs=torch.ones_like(_mlp_output)
+                      )[0]
+                      self.router_grads[router_type] = router_grads.cpu().flatten().float()
+              
+              mlp_output, mlp_bias = self.mlp(layernorm_output, attention_scores, self.expert_buffer, queries=queries, keys=keys)
+            else:
+              mlp_output, mlp_bias = self.mlp(layernorm_output)
 
             with torch.enable_grad():
                 # dense llama MLP and MoE don't support bias

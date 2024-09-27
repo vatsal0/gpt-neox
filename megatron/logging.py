@@ -175,13 +175,14 @@ def training_log(
               v.reset_logging_buffers()
 
     if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+        from megatron.model.moe import ParallelDroplessMoE
         for k,v in model.named_modules():
             # if k.endswith('.router'):
                 # temp = v.global_routing_counts.cpu()
                 # routing[k] = {'expert_'+str(i):x.item() for i,x in enumerate(temp)}
                 # max_per_layer[re.search(r'\d+',k,)] = temp.max()
                 # max_routed = get_max(max_routed,temp)
-            if k.endswith('.mlp') and not k.endswith('.experts.mlp'):
+            if k.endswith('.mlp') and not k.endswith('.experts.mlp') and isinstance(v, ParallelDroplessMoE):
                 moe_stats[k] = {stat:val/(neox_args.gradient_accumulation_steps * neox_args.world_size) for stat, val in v.stats.items()}
                 for stat in v.stats.keys():
                     v.stats[stat] = 0
