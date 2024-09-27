@@ -136,13 +136,11 @@ class Router(torch.nn.Module):
         with torch.no_grad():
             expert_indices_ft = expert_indices.flatten()
             tokens_per_expert = megablocks.ops.histogram(expert_indices_ft, self.num_experts)
-        expert_weights, lbl_loss = self.apply_load_balancing_loss(scores, tokens_per_expert, activation=expert_weights)
-        lbl_loss_temp = lbl_loss.detach()
-        global_lbl_loss = torch.distributed.all_reduce(
-                lbl_loss_temp,
-                group=self.data_parallel_group,
-                op=torch.distributed.ReduceOp.SUM,
-                async_op=True,
+            global_tokens_per_expert = torch.distributed.all_reduce(
+              tokens_per_expert,
+              group=self.data_parallel_group,
+              op=torch.distributed.ReduceOp.SUM,
+              async_op=True,
             )
 
         if router_type_override is None:
@@ -159,9 +157,10 @@ class Router(torch.nn.Module):
         if self.expert_parallel_rank == 0 and self.training:
             self.save_z_loss(z_loss_temp / (self.neox_args.global_num_gpus * self.moe_z_loss_coeff))
 
-        global_lbl_loss.wait()
+        global_tokens_per_expert.wait()
+        expert_weights, lbl_loss = self.apply_load_balancing_loss(scores, tokens_per_expert / self.neox_args.global_num_gpus, activation=expert_weights)
         if self.expert_parallel_rank == 0 and self.training:
-            self.save_lbl_loss(lbl_loss_temp / (self.neox_args.global_num_gpus * self.moe_aux_loss_coeff))
+            self.save_lbl_loss(lbl_loss / (self.neox_args.global_num_gpus * self.moe_aux_loss_coeff))
         
         if router_type_override is None:
             global_routing_counts.wait()
