@@ -1318,3 +1318,9 @@ class NeoXArgsMoE(NeoXArgsTemplate):
     log_sims: bool = False
 
     dense_warmup_iters: int = 50
+
+    detach_approx: bool = True
+    """
+    By default, detach expert outputs before approximating so that 
+    the approximation gradient does not propagate into the experts.
+    """

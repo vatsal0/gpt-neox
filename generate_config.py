@@ -13,6 +13,7 @@ parser.add_argument('--num_experts', '-n', type=int, required=True)
 parser.add_argument('--top_k', '-k', type=int, required=True)
 parser.add_argument('--router', '-r', type=str, choices={'topk', 'expert_prob_approx', 'dense'}, required=True)
 parser.add_argument('--dense_warmup', type=int, default=500)
+parser.add_argument('--no_detach', action='store_true', default=False)
 parser.add_argument('--aux_loss', type=float, default=0.01)
 parser.add_argument('--z_loss', type=float, default=0)
 parser.add_argument('--lr', type=float, required=True)
@@ -50,6 +51,8 @@ config['moe_top_k'] = args.top_k
 config['moe_router_type'] = args.router
 if args.router == 'dense':
   config['dense_warmup_iters'] = args.dense_warmup
+if args.no_detach:
+  config['detach_approx'] = False
 
 config['moe_aux_loss_coeff'] = args.aux_loss
 config['moe_z_loss_coeff'] = args.z_loss

@@ -77,6 +77,7 @@ class ParallelDroplessMLP(torch.nn.Module):
             raise KeyError(neox_args.mlp_type)
 
         self.total_approx_count = 0
+        self.detach_approx = neox_args.detach_approx
 
     def indices_and_bins(self, top_expert: torch.Tensor):
         # Sort the expert ids to produce the scatter/gather
@@ -172,7 +173,8 @@ class ParallelDroplessMLP(torch.nn.Module):
         input_indices = indices // top_k
 
         # ith element of output will be added to index corresponding to input index, and associated expert
-        expert_buffer.index_add_(dim=0, index=self.num_experts * input_indices + bin_ids, source=output.detach())
+        expert_output = expert_buffer.index_add(dim=0, index=self.num_experts * input_indices + bin_ids, 
+                                                source=output.detach() if self.detach_approx else output)
 
         # Un-route the data for the MoE output
         return megablocks.ops.scatter(
@@ -182,7 +184,7 @@ class ParallelDroplessMLP(torch.nn.Module):
             expert_weights,
             bins,
             top_k,
-        )
+        ), expert_output
 
     def forward(self, x, expert_weights, expert_indices, expert_buffer, dense=False):
         """
@@ -205,7 +207,7 @@ class ParallelDroplessMLP(torch.nn.Module):
                 expert_indices
             )
 
-        x = self.permute_and_compute(
+        x, expert_output = self.permute_and_compute(
             x,
             tokens_per_expert,
             indices,
@@ -218,7 +220,7 @@ class ParallelDroplessMLP(torch.nn.Module):
 
         x = x.view(in_shape)
 
-        return x
+        return x, expert_output
 
 
 def cast_if_autocast_enabled(tensor: torch.Tensor):
@@ -282,9 +284,9 @@ class ParallelDroplessMoE(torch.nn.Module):
         expert_weights, expert_indices, scores = self.router(x, router_type_override=router_type_override)
 
         # return value should be
-        output = self.experts(x, expert_weights, expert_indices, expert_buffer)
+        output, expert_output = self.experts(x, expert_weights, expert_indices, expert_buffer)
 
-        expert_output = expert_buffer.view(
+        expert_output = expert_output.view(
             x.shape[0] * x.shape[1], 
             self.experts.num_experts, 
             x.size(-1)
