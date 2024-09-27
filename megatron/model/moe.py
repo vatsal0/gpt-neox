@@ -253,6 +253,7 @@ class ParallelDroplessMoE(torch.nn.Module):
         self.group_topk = neox_args.group_top_k
         self.log_sims = neox_args.log_sims
         self.data_parallel_group = get_data_parallel_group()
+        self.stats = {}
         if self.log_sims:
           self.stats = {
               'avg_sim_0': 0,

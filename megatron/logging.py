@@ -151,12 +151,19 @@ def training_log(
     max_routed = 0
     # max_per_layer = {}
 
+    # HACK dense warmup is done
+    if neox_args.moe_router_type == "dense" and iteration >= neox_args.dense_warmup_iters:
+      for k,v in model.named_modules():
+          if k.endswith('.router'):
+            v.router_type = "dense"
+
     BUFFER_ITERS = 250
     if iteration % BUFFER_ITERS == 0:
       for k,v in model.named_modules():
           if k.endswith('.router'):
               routing_counts = v.train_routing_count_buffer.view(BUFFER_ITERS, -1, *v.train_routing_count_buffer.shape[1:])
               lbl_losses = v.lbl_loss_buffer.view(BUFFER_ITERS, -1, *v.lbl_loss_buffer.shape[1:])
+              z_losses = v.z_loss_buffer.view(BUFFER_ITERS, -1, *v.z_loss_buffer.shape[1:])
               if neox_args.save is not None:
                   layer = re.search(r'\d+',k,).group()
                   rank = 0 if not torch.distributed.is_initialized() else torch.distributed.get_rank()
@@ -164,6 +171,7 @@ def training_log(
                   os.makedirs(save_path, exist_ok=True)
                   torch.save(routing_counts, os.path.join(save_path, f'routing_counts_{iteration}.pt'))
                   torch.save(lbl_losses, os.path.join(save_path, f'lbl_losses_{iteration}.pt'))
+                  torch.save(z_losses, os.path.join(save_path, f'z_losses_{iteration}.pt'))
               v.reset_logging_buffers()
 
     if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:

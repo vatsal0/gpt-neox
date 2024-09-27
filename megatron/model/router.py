@@ -44,10 +44,12 @@ class Router(torch.nn.Module):
         self.neox_args = neox_args
         
         self.moe_aux_loss_coeff = neox_args.moe_aux_loss_coeff / neox_args.gradient_accumulation_steps
+        self.moe_z_loss_coeff = neox_args.moe_z_loss_coeff / neox_args.gradient_accumulation_steps
         init_method(self.layer.weight)
 
         self.num_experts = neox_args.moe_num_experts
         self.router_type = neox_args.moe_router_type
+        if self.router_type == "dense": self.router_type = "topk" # HACK start with topk
         self.tokens_per_batch = neox_args.seq_length * neox_args.train_micro_batch_size_per_gpu
         self.expert_parallel_group = get_model_parallel_group()
         self.expert_parallel_rank = get_model_parallel_rank()
@@ -77,6 +79,10 @@ class Router(torch.nn.Module):
         )
         return aux_loss
 
+    def z_loss_func(self, logits, z_loss_coeff):
+        z_loss = torch.mean(torch.square(torch.logsumexp(logits, dim=-1))) * z_loss_coeff
+        return z_loss
+
     def apply_load_balancing_loss(
             self,
             probs: torch.Tensor,
@@ -90,6 +96,14 @@ class Router(torch.nn.Module):
             
             return activation, aux_loss
 
+    def apply_z_loss(self, logits):
+        if self.moe_z_loss_coeff is not None:
+            z_loss = self.z_loss_func(logits, self.moe_z_loss_coeff)
+            logits = MoEAuxLossAutoScaler.apply(logits, z_loss)
+            return logits, z_loss
+        else:
+            return logits, None
+
     def forward(self, x, router_type_override=None):
         router_type = router_type_override
         
@@ -100,7 +114,15 @@ class Router(torch.nn.Module):
             x = x * self.jitter(x)
 
         logits = self.layer(x.view(-1, x.shape[-1]))
-        
+
+        logits, z_loss = self.apply_z_loss(logits)
+        z_loss_temp = z_loss.detach()
+        global_z_loss = torch.distributed.all_reduce(
+                z_loss_temp,
+                group=self.data_parallel_group,
+                op=torch.distributed.ReduceOp.SUM,
+                async_op=True,
+            )
         if router_type == "topk" or router_type == "dense_approx" or router_type == "dense_approx_lsh" or router_type == "dense_approx_efficient" or router_type == "expert_prob_approx" or router_type == "dense":
             scores = logits.softmax(dim=-1)
             expert_weights, expert_indices = self._top_k(scores)
@@ -133,6 +155,10 @@ class Router(torch.nn.Module):
                   async_op=True,
               )
 
+        global_z_loss.wait()
+        if self.expert_parallel_rank == 0 and self.training:
+            self.save_z_loss(z_loss_temp / (self.neox_args.global_num_gpus * self.moe_z_loss_coeff))
+
         global_lbl_loss.wait()
         if self.expert_parallel_rank == 0 and self.training:
             self.save_lbl_loss(lbl_loss_temp / (self.neox_args.global_num_gpus * self.moe_aux_loss_coeff))
@@ -164,3 +190,11 @@ class Router(torch.nn.Module):
             self.lbl_loss_buffer = torch.cat([self.lbl_loss_buffer,
                                                 new_loss.unsqueeze(0)],
                                                 dim=0)
+
+    def save_z_loss(self, new_loss):
+        if self.z_loss_buffer == None:
+            self.z_loss_buffer = new_loss.unsqueeze(0)
+        else:
+            self.z_loss_buffer = torch.cat([self.z_loss_buffer,
+                                            new_loss.unsqueeze(0)],
+                                            dim=0)

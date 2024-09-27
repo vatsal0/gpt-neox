@@ -1313,4 +1313,8 @@ class NeoXArgsMoE(NeoXArgsTemplate):
 
     moe_aux_loss_coeff: float = 0.0
 
+    moe_z_loss_coeff: float = 0.0
+
     log_sims: bool = False
+
+    dense_warmup_iters: int = 50
