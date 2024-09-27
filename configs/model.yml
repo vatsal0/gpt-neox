@@ -1,0 +1,27 @@
+{
+  "num_layers": 24,
+  "hidden_size": 1024,
+  "num_attention_heads": 16,
+  "seq_length": 2048,
+  "max_position_embeddings": 2048,
+  "norm": "layernorm",
+  "pos_emb": "rotary",
+  "no_weight_tying": true,
+  "gpt_j_residual": false,
+  "output_layer_parallelism": "column",
+  "attention_config": [[["flash"], 24]],
+
+  "group_top_k": 2,
+  "moe_jitter_eps": 0.00,
+  "mlp_type": "llama",
+  "simulate_router_gradients": false,
+  "log_sims": false,
+
+  "tokenizer_type": "HFTokenizer",
+
+  "tensorboard_dir": "tensorboard",
+  "log_dir": "logs",
+  "use_wandb": true,
+  "wandb_host": "https://api.wandb.ai",
+  "wandb_project": "neox-wikitext-sparsemixer"
+}
