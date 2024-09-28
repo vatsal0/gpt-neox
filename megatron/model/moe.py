@@ -266,6 +266,8 @@ class ParallelDroplessMoE(torch.nn.Module):
               'pct_sim_2': 0,
               'exp_avg_sim': 0,
           }
+          
+        self.forward_approx = neox_args.forward_approx
 
     def forward(self, x, attention_scores, expert_buffer, queries=None, keys=None, router_type_override=None):
         router_type = router_type_override
@@ -504,5 +506,8 @@ class ParallelDroplessMoE(torch.nn.Module):
             # ntokens x nexperts x nexperts x 1 * nexperts x nexperts x hidden_dim -> sum -> ntokens x nexperts x hidden_dim
             # divide by num of groups a token used for one expert approx
             approx_output = torch.matmul((scores.unsqueeze(1) * approx_mask).flatten(1, 2), approx.flatten(0, 1) / self.group_topk).view(x.shape)
-            return output + approx_output - approx_output.detach(), None
+            if self.forward_approx and self.training:
+              return output + approx_output, None
+            else:
+              return output + approx_output - approx_output.detach(), None
         return output, None

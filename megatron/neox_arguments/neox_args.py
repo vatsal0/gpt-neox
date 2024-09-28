@@ -1324,3 +1324,8 @@ class NeoXArgsMoE(NeoXArgsTemplate):
     By default, detach expert outputs before approximating so that 
     the approximation gradient does not propagate into the experts.
     """
+
+    forward_approx: bool = False
+    """
+    Whether to use the dense approximation in the forward pass.
+    """
