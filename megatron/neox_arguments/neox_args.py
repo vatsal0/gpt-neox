@@ -1329,3 +1329,8 @@ class NeoXArgsMoE(NeoXArgsTemplate):
     """
     Whether to use the dense approximation in the forward pass.
     """
+
+    efficient_expert_approx: bool = False
+    """
+    When true, use the efficient implementation of expert group approx
+    """
