@@ -30,6 +30,33 @@ print('done compiling')
 from torch.nn.attention.flex_attention import flex_attention
 from torch.nn.attention.flex_attention import create_block_mask
 
+def approx(orig_expert_output, buffer, num_experts, top_k, group_topk, indices, bin_ids, scores, expert_indices, in_shape):
+    buffer.zero_()
+
+    expert_output = buffer.index_add(dim=0, index=num_experts * (indices // top_k) + bin_ids, 
+                                                source=orig_expert_output)
+    
+    expert_output = expert_output.view(in_shape[0] * in_shape[1], num_experts, in_shape[-1])
+
+    _, group_indices = scores.topk(k=group_topk, dim=-1)
+    group_indices_expanded = group_indices.unsqueeze(1).expand(-1, num_experts, -1)
+
+    expert_indices_expanded = expert_indices.unsqueeze(1).expand(-1, num_experts, -1)
+
+    expert_range = torch.arange(num_experts, device=expert_indices.device).unsqueeze(0).unsqueeze(2)
+    routed_mask = (expert_indices_expanded == expert_range).any(dim=-1)
+    group_mask = (group_indices_expanded == expert_range).any(dim=-1)
+    if top_k < group_topk:
+        # token does not have outputs for its groups that are not in the experts top k
+        top_mask = group_mask.unsqueeze(2) & routed_mask.unsqueeze(1)
+    else:
+        top_mask = group_mask.unsqueeze(2) & group_mask.unsqueeze(1)
+    weighted_mask = top_mask * scores.unsqueeze(1)
+    approx = torch.einsum('nij,njd->ijd', top_mask.to(dtype=expert_output.dtype), expert_output) / top_mask.sum(dim=0).unsqueeze(-1).clamp(min=1)
+    approx_mask = (group_mask.unsqueeze(2) & ~routed_mask.unsqueeze(1))
+    approx_output = torch.matmul((scores.unsqueeze(1) * approx_mask).flatten(1, 2), approx.flatten(0, 1) / group_topk)
+    return approx_output
+
 class ParallelDroplessMLP(torch.nn.Module):
     """
     This class defines MoE expert computation, using tensor (model) parallel size as the expert parallel size
@@ -112,6 +139,9 @@ class ParallelDroplessMLP(torch.nn.Module):
         bins: torch.Tensor,
         top_k: int,
         expert_buffer: torch.Tensor,
+        scores=None, 
+        expert_indices=None, 
+        in_shape=None
     ):
         """
         grouped_permute_and_compute
@@ -172,6 +202,36 @@ class ParallelDroplessMLP(torch.nn.Module):
         # e.g. indices 0, 1, 2, 3 will all correspond to input 0 if top_k = 4
         input_indices = indices // top_k
 
+        group_topk = 2
+        _, group_indices = scores.topk(k=group_topk, dim=-1)
+        sums = torch.zeros(self.num_experts * self.num_experts, output.shape[-1], dtype=output.dtype, device=output.device)
+
+        # use this output given for expert i only if the corresponding input belongs to group i
+        mask = (group_indices[input_indices] == bin_ids.unsqueeze(1)).any(dim=-1)
+        # 2d index; row is the group we are approxing for and column is the expert we are approxing
+        approx_indices = group_indices[input_indices] * self.num_experts + bin_ids.unsqueeze(1)
+        total_counts = approx_indices[mask].flatten().bincount().clamp(min=1).unsqueeze(1)
+        
+        # two options: scale outputs by approximation weight first, or scale after summing (the latter should be less precise?)
+        approx_vals = sums.index_add(0, approx_indices[mask].flatten(), output[mask].repeat_interleave(group_topk, dim=0) / total_counts[approx_indices[mask].flatten()])
+        # approx_vals = sums.index_add(0, approx_indices[mask].flatten(), output[mask].repeat_interleave(group_topk, dim=0)) / total_counts
+        
+        # for each input: which approx is it gonna use, and with which corresponding weight
+        missing_expert_weights, missing_expert_indices = (-scores).topk(k=self.num_experts - top_k, dim=-1)
+        # tokens x experts
+        
+        # same 2d index, tokens x group x experts
+        missing_approx_indices = (group_indices.unsqueeze(2) * self.num_experts + missing_expert_indices.unsqueeze(1))
+
+        from pdb import set_trace
+        set_trace()
+        # corresponding approx for tokens x group x expert, weights token x expert -> tokens x group x expert x 1, weighted sum of experts, averaged over groups
+        approx_output = (approx_vals[missing_approx_indices] * -missing_expert_weights.unsqueeze(1).unsqueeze(-1)).sum(dim=2).mean(dim=1)
+        # approx_output = (approx_vals[missing_approx_indices.flatten()] * missing_expert_weights.unsqueeze(1).repeat_interleave(group_topk, dim=1).flatten().unsqueeze(1)).view(in_shape[0] * in_shape[1], group_topk, self.num_experts - top_k, -1).sum(dim=2).mean(dim=1)
+        
+        prev_approx = approx(output, expert_buffer, self.num_experts, top_k, 2, indices, bin_ids, scores, expert_indices, in_shape)
+        ((approx_output - prev_approx).abs() > 1e-4).sum()/12582912
+        
         # ith element of output will be added to index corresponding to input index, and associated expert
         expert_output = expert_buffer.index_add(dim=0, index=self.num_experts * input_indices + bin_ids, 
                                                 source=output.detach() if self.detach_approx else output)
@@ -186,7 +246,7 @@ class ParallelDroplessMLP(torch.nn.Module):
             top_k,
         ), expert_output
 
-    def forward(self, x, expert_weights, expert_indices, expert_buffer, dense=False):
+    def forward(self, x, expert_weights, expert_indices, expert_buffer, scores=None, all_expert_indices=None, dense=False):
         """
         grouped_forward_once
 
@@ -215,7 +275,10 @@ class ParallelDroplessMLP(torch.nn.Module):
             expert_weights,
             bins,
             self.top_k if not dense else self.num_experts,
-            expert_buffer.view(-1, x.size(-1))
+            expert_buffer.view(-1, x.size(-1)),
+            scores=scores, 
+            expert_indices=all_expert_indices, 
+            in_shape=in_shape
         )
 
         x = x.view(in_shape)
@@ -286,7 +349,7 @@ class ParallelDroplessMoE(torch.nn.Module):
         expert_weights, expert_indices, scores = self.router(x, router_type_override=router_type_override)
 
         # return value should be
-        output, expert_output = self.experts(x, expert_weights, expert_indices, expert_buffer)
+        output, expert_output = self.experts(x, expert_weights, expert_indices, expert_buffer, scores=scores, all_expert_indices=expert_indices)
 
         expert_output = expert_output.view(
             x.shape[0] * x.shape[1], 
