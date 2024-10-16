@@ -1,4 +1,5 @@
 import torch
+import megablocks.ops
 
 def expert_approx(output, input_indices, bin_ids, scores, num_experts, top_k, group_topk):
   _, group_indices = scores.topk(k=group_topk, dim=-1)
@@ -8,7 +9,7 @@ def expert_approx(output, input_indices, bin_ids, scores, num_experts, top_k, gr
   mask = (group_indices[input_indices] == bin_ids.unsqueeze(1)).any(dim=-1)
   # 2d index; row is the group we are approxing for and column is the expert we are approxing
   approx_indices = group_indices[input_indices] * num_experts + bin_ids.unsqueeze(1)
-  total_counts = approx_indices[mask].flatten().bincount().clamp(min=1).unsqueeze(1)
+  total_counts = megablocks.ops.histogram(approx_indices[mask].flatten(), num_experts * num_experts).clamp(min=1).unsqueeze(1)
 
   # two options: scale outputs by approximation weight first, or scale after summing (the latter should be less precise?)
   approx_vals = sums.index_add(0, approx_indices[mask].flatten(), output[mask].repeat_interleave(group_topk, dim=0) / total_counts[approx_indices[mask].flatten()])
