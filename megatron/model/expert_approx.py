@@ -19,10 +19,8 @@ def approx_vals_kernel(
   M: tl.constexpr,
   BLOCK_SIZE: tl.constexpr
 ):
-  # Compute the program ID
   pid = tl.program_id(0)
   
-  # Compute the start index for this block
   start_idx = pid * BLOCK_SIZE
   
   for i in range(BLOCK_SIZE):
@@ -36,6 +34,35 @@ def approx_vals_kernel(
         if write_index < M:
           tl.atomic_add(approx_vals_ptr + write_index * D + tl.arange(0, D), output_fp32 / scale)
 
+@triton.jit
+def approx_output_kernel(
+  approx_vals_ptr,
+  approx_indices_ptr,
+  expert_weights_ptr,
+  approx_output_ptr,
+  N: tl.constexpr,
+  D: tl.constexpr,
+  K: tl.constexpr,
+  E: tl.constexpr,
+  BLOCK_SIZE: tl.constexpr
+):
+  pid = tl.program_id(0)
+  
+  start_idx = pid * BLOCK_SIZE
+
+  for i in range(BLOCK_SIZE):
+    if start_idx + i < N:
+      expert_index = tl.arange(0, triton.next_power_of_2(E))
+      expert_mask = expert_index < E
+
+      group_expert_index = tl.arange(0, K)[:, None] * E + expert_index[None, :]
+      approx_indices = tl.load(approx_indices_ptr + (start_idx + i) * K * E + group_expert_index, mask=expert_mask[None, :])
+
+      approx_vals = tl.load(approx_vals_ptr + approx_indices[:, :, None] * D + tl.arange(0, D)[None, None, :])
+      expert_weights = tl.load(expert_weights_ptr + (start_idx + i) * E + expert_index, mask=expert_mask)
+      result = tl.sum(tl.sum(expert_weights[None, :, None] * approx_vals, axis=0), axis=0)
+      tl.store(approx_output_ptr + (start_idx + i) * D + tl.arange(0, D), -result/K)
+
 @torch.compile
 def expert_approx(output: torch.Tensor, input_indices: torch.Tensor, bin_ids: torch.Tensor, scores: torch.Tensor, num_experts: int, top_k: int, group_topk: int):
   _, group_indices = scores.topk(k=group_topk, dim=-1)
@@ -48,7 +75,7 @@ def expert_approx(output: torch.Tensor, input_indices: torch.Tensor, bin_ids: to
   total_counts = megablocks.ops.histogram(approx_indices[mask].flatten(), num_experts * num_experts).clamp(min=1).unsqueeze(1)
 
   N, D = output.shape
-  K = approx_indices.shape[1]
+  K = group_topk
   M = num_experts * num_experts
   
   approx_vals = torch.zeros((M, D), dtype=torch.float32, device=output.device)
@@ -69,6 +96,14 @@ def expert_approx(output: torch.Tensor, input_indices: torch.Tensor, bin_ids: to
   missing_approx_indices = (group_indices.unsqueeze(2) * num_experts + missing_expert_indices.unsqueeze(1))
 
   # corresponding approx for tokens x group x expert, weights token x expert -> tokens x 1 x expert x 1, weighted sum of experts, averaged over groups
-  approx_output = torch.einsum('nged,ne->nd', approx_vals[missing_approx_indices], -missing_expert_weights)/group_topk
+  N, K, E = missing_approx_indices.shape
+  approx_output = torch.zeros((N, D), dtype=output.dtype, device=output.device)
+
+  grid = lambda meta: (triton.cdiv(N, BLOCK_SIZE),)
+  approx_output_kernel[grid](
+    approx_vals, missing_approx_indices, missing_expert_weights, approx_output,
+    N, D, K, E,
+    BLOCK_SIZE=BLOCK_SIZE
+  )
 
   return approx_output
