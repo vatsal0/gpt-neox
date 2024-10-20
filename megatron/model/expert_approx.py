@@ -44,6 +44,7 @@ def approx_output_kernel(
   D: tl.constexpr,
   K: tl.constexpr,
   E: tl.constexpr,
+  E2: tl.constexpr,
   BLOCK_SIZE: tl.constexpr
 ):
   pid = tl.program_id(0)
@@ -52,7 +53,7 @@ def approx_output_kernel(
 
   for i in range(BLOCK_SIZE):
     if start_idx + i < N:
-      expert_index = tl.arange(0, triton.next_power_of_2(E))
+      expert_index = tl.arange(0, E2)
       expert_mask = expert_index < E
 
       group_expert_index = tl.arange(0, K)[:, None] * E + expert_index[None, :]
@@ -102,7 +103,7 @@ def expert_approx(output: torch.Tensor, input_indices: torch.Tensor, bin_ids: to
   grid = lambda meta: (triton.cdiv(N, BLOCK_SIZE),)
   approx_output_kernel[grid](
     approx_vals, missing_approx_indices, missing_expert_weights, approx_output,
-    N, D, K, E,
+    N, D, K, E, triton.next_power_of_2(E),
     BLOCK_SIZE=BLOCK_SIZE
   )
 
