@@ -17,6 +17,7 @@ import triton.language as tl
         triton.Config({'BLOCK_SIZE': 64}, num_stages=4, num_warps=8),
     ],
     key=['N'],
+    reset_to_zero=['approx_vals_ptr']
 )
 @triton.jit
 def approx_vals_kernel(
@@ -58,6 +59,7 @@ def approx_vals_kernel(
         triton.Config({'BLOCK_SIZE': 64}, num_stages=4, num_warps=8),
     ],
     key=['N'],
+    reset_to_zero=['output_grad_ptr']
 )
 @triton.jit
 def approx_vals_backward_kernel(
@@ -96,6 +98,7 @@ def approx_vals_backward_kernel(
         triton.Config({'BLOCK_SIZE': 64}, num_stages=4, num_warps=8),
     ],
     key=['N'],
+    reset_to_zero=['approx_output_ptr']
 )
 @triton.jit
 def approx_output_kernel(
