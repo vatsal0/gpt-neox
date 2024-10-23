@@ -4,8 +4,20 @@ import megablocks.ops
 import triton
 import triton.language as tl
 
-BLOCK_SIZE = 32
 
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': 8}, num_stages=5, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 16}, num_stages=5, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 32}, num_stages=5, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 64}, num_stages=5, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 8}, num_stages=4, num_warps=8),
+        triton.Config({'BLOCK_SIZE': 16}, num_stages=4, num_warps=8),
+        triton.Config({'BLOCK_SIZE': 32}, num_stages=4, num_warps=8),
+        triton.Config({'BLOCK_SIZE': 64}, num_stages=4, num_warps=8),
+    ],
+    key=['N'],
+)
 @triton.jit
 def approx_vals_kernel(
   output_ptr,
@@ -34,6 +46,19 @@ def approx_vals_kernel(
         if write_index < M:
           tl.atomic_add(approx_vals_ptr + write_index * D + tl.arange(0, D), output_fp32 / scale)
 
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': 8}, num_stages=5, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 16}, num_stages=5, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 32}, num_stages=5, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 64}, num_stages=5, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 8}, num_stages=4, num_warps=8),
+        triton.Config({'BLOCK_SIZE': 16}, num_stages=4, num_warps=8),
+        triton.Config({'BLOCK_SIZE': 32}, num_stages=4, num_warps=8),
+        triton.Config({'BLOCK_SIZE': 64}, num_stages=4, num_warps=8),
+    ],
+    key=['N'],
+)
 @triton.jit
 def approx_vals_backward_kernel(
   output_grad_ptr,
@@ -59,6 +84,19 @@ def approx_vals_backward_kernel(
       output_grad = tl.sum(approx_grad / total_counts[:, None], axis=0)
       tl.store(output_grad_ptr + (start_idx + i) * D + tl.arange(0, D), output_grad)
 
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': 8}, num_stages=5, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 16}, num_stages=5, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 32}, num_stages=5, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 64}, num_stages=5, num_warps=4),
+        triton.Config({'BLOCK_SIZE': 8}, num_stages=4, num_warps=8),
+        triton.Config({'BLOCK_SIZE': 16}, num_stages=4, num_warps=8),
+        triton.Config({'BLOCK_SIZE': 32}, num_stages=4, num_warps=8),
+        triton.Config({'BLOCK_SIZE': 64}, num_stages=4, num_warps=8),
+    ],
+    key=['N'],
+)
 @triton.jit
 def approx_output_kernel(
   approx_vals_ptr,
@@ -100,11 +138,10 @@ class group_approx(torch.autograd.Function):
     M = total_counts.shape[0]
     approx_vals = torch.zeros((M, D), dtype=torch.float32, device=output.device)
   
-    grid = lambda meta: (triton.cdiv(N, BLOCK_SIZE),)
+    grid = lambda meta: (triton.cdiv(N, meta['BLOCK_SIZE']),)
     approx_vals_kernel[grid](
       output, approx_indices, mask, total_counts, approx_vals,
       N, D, K, M,
-      BLOCK_SIZE=BLOCK_SIZE
     )
     return approx_vals.to(dtype=output.dtype)
   
@@ -116,11 +153,10 @@ class group_approx(torch.autograd.Function):
     D = approx_grad.shape[-1]
     output_grad = torch.zeros(N, D, dtype=approx_grad.dtype, device=approx_grad.device)
 
-    grid = lambda meta: (triton.cdiv(N, BLOCK_SIZE),)
+    grid = lambda meta: (triton.cdiv(N, meta['BLOCK_SIZE']),)
     approx_vals_backward_kernel[grid](
       output_grad, approx_grad, approx_indices, mask, total_counts,
       N, D, K,
-      BLOCK_SIZE=BLOCK_SIZE
     )
     
     return output_grad, None, None, None
@@ -150,11 +186,10 @@ def expert_approx(output: torch.Tensor, input_indices: torch.Tensor, bin_ids: to
   D = output.shape[-1]
   approx_output = torch.zeros((N, D), dtype=output.dtype, device=output.device)
 
-  grid = lambda meta: (triton.cdiv(N, BLOCK_SIZE),)
+  grid = lambda meta: (triton.cdiv(N, meta['BLOCK_SIZE']),)
   approx_output_kernel[grid](
     approx_vals, missing_approx_indices, missing_expert_weights, approx_output,
     N, D, K, E, triton.next_power_of_2(E),
-    BLOCK_SIZE=BLOCK_SIZE
   )
 
   return approx_output
